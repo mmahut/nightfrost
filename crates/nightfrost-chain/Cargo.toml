@@ -1,0 +1,27 @@
+[package]
+name    = "nightfrost-chain"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+
+[dependencies]
+nightfrost-core    = { workspace = true }
+anyhow             = { workspace = true }
+async-stream       = { workspace = true }
+const-hex          = { workspace = true }
+derive_more        = { workspace = true, features = ["from"] }
+fjall              = { workspace = true }
+futures            = { workspace = true }
+http               = { workspace = true }
+itertools          = { workspace = true }
+parity-scale-codec = { workspace = true }
+serde              = { workspace = true, features = ["derive"] }
+subxt              = { workspace = true, features = ["reconnecting-rpc-client"] }
+thiserror          = { workspace = true }
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tracing            = { workspace = true }
+
+[build-dependencies]
+anyhow    = { workspace = true }
+itertools = { workspace = true }

@@ -1,0 +1,40 @@
+[package]
+name    = "nightfrost-core"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+
+[dependencies]
+# ledger v8 + shared
+midnight-base-crypto_v1      = { workspace = true }
+midnight-coin-structure_v2   = { workspace = true }
+midnight-ledger_v8           = { workspace = true }
+midnight-onchain-runtime_v3  = { workspace = true }
+midnight-serialize_v1        = { workspace = true }
+midnight-storage-core_v1     = { workspace = true, features = ["layout-v2", "gc-v1"] }
+midnight-transient-crypto_v2 = { workspace = true }
+midnight-zswap_v8            = { workspace = true }
+# ledger v9 rc
+midnight-coin-structure_v3   = { workspace = true }
+midnight-ledger_v9           = { workspace = true }
+midnight-onchain-runtime_v4  = { workspace = true }
+midnight-transient-crypto_v3 = { workspace = true }
+midnight-zswap_v9            = { workspace = true }
+
+const-hex          = { workspace = true, features = ["serde"] }
+derive_more        = { workspace = true, features = ["as_ref", "debug", "deref", "display", "from", "into"] }
+fjall              = { workspace = true }
+futures            = { workspace = true }
+itertools          = { workspace = true }
+parity-scale-codec = { workspace = true }
+postcard           = { workspace = true }
+serde              = { workspace = true, features = ["derive"] }
+sha2               = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true, features = ["time"] }
+tracing            = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile   = "3"

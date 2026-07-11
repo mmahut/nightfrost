@@ -1,0 +1,8 @@
+nightfrost
+Copyright (c) 2026 Marek Mahut
+
+This product includes software developed by the Midnight Foundation:
+portions of the ledger facade, node integration, and build tooling are
+vendored and adapted from midnight-indexer
+(https://github.com/midnightntwrk/midnight-indexer), licensed under the
+Apache License, Version 2.0.
