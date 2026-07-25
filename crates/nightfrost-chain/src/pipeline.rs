@@ -47,6 +47,19 @@ pub async fn run(
     network_id: NetworkId,
     highest_block_on_node: store::NodeTipHeight,
 ) -> anyhow::Result<()> {
+    // A reused data directory must belong to this chain; anything else would
+    // fail later with a confusing parent-hash mismatch loop.
+    if let Some(stored) = store.meta.get(meta_keys::GENESIS_HASH).context("read genesis hash")? {
+        let node_genesis = node.genesis_hash();
+        if stored.as_ref() != node_genesis {
+            bail!(
+                "data directory belongs to a different chain: stored genesis {}, node genesis {}",
+                const_hex::encode(stored.as_ref()),
+                const_hex::encode(node_genesis),
+            );
+        }
+    }
+
     let last_height = store.last_indexed_height().context("read last height")?;
     let resume_from = match last_height {
         Some(height) => {
@@ -415,10 +428,30 @@ fn apply_transaction(
                     let balances = if action.state.is_empty() {
                         vec![]
                     } else {
-                        ContractState::deserialize(&action.state, ledger_version)
-                            .context("deserialize contract state")?
-                            .balances()
-                            .context("extract contract balances")?
+                        match ContractState::deserialize(&action.state, ledger_version)
+                            .and_then(|state| state.balances())
+                        {
+                            Ok(balances) => balances,
+                            Err(error) => {
+                                // A handful of real contract states on live networks
+                                // trip an overly strict merkle-patricia-trie
+                                // canonicalization invariant in the vendored
+                                // midnight-storage decoder (an upstream decoder
+                                // issue, not something wrong in our own replay):
+                                // extension-node chains not maximally merged to
+                                // exactly 255 nibbles. Losing balances for this one
+                                // action is far better than permanently wedging the
+                                // indexer on this block forever, so treat it like
+                                // the empty-state case above instead of aborting.
+                                tracing::warn!(
+                                    address = %const_hex::encode(&action.address.0),
+                                    block_height = block.height,
+                                    error = format!("{:#}", anyhow::Error::new(error)),
+                                    "failed to deserialize contract state; recording zero balances"
+                                );
+                                vec![]
+                            }
+                        }
                     };
                     let record = ContractActionRecord {
                         address: action.address.clone(),
@@ -570,6 +603,13 @@ fn write_block(
                 [],
             );
 
+            // Failed actions (empty state) stay indexed for parity with the
+            // official indexer, but never become a contract's deploy/latest
+            // pointer — /contracts/{addr}/state must not serve an empty state.
+            if record.state.is_empty() {
+                continue;
+            }
+
             let contract = match contracts_this_block.get(&address.0) {
                 Some(contract) => Some(contract.clone()),
                 None => store
@@ -591,12 +631,36 @@ fn write_block(
             contracts_this_block.insert(address.0.clone(), contract);
         }
 
-        // Ledger events (also feeding the dust generation index).
+        // Ledger events (also feeding the per-contract and dust generation
+        // indexes). Contract events are correlated with the emitting
+        // `ContractCall` of the same transaction by (address, entry_point),
+        // exactly like the official chain-indexer (ticket #1162).
         for event in &applied.ledger_events {
             let event_id = ids.next_event_id;
             ids.next_event_id += 1;
+
+            let mut event = event.clone();
+            event.contract_action_id = nightfrost_core::domain::correlate_contract_action_id(
+                &event,
+                applied
+                    .contract_actions
+                    .iter()
+                    .zip(&contract_action_ids)
+                    .map(|((address, record), &action_id)| {
+                        (action_id, address, &record.attributes)
+                    }),
+            )
+            .or(event.contract_action_id);
+            if let Some(address) = &event.contract_address {
+                batch.insert(
+                    &store.events_by_contract,
+                    prefixed_u64_key(address, event_id),
+                    [],
+                );
+            }
+
             let record = EventRecord {
-                event: event.clone(),
+                event,
                 tx_id,
                 block_height: block.height,
             };
@@ -605,30 +669,33 @@ fn write_block(
                 event_id.to_be_bytes(),
                 store::encode(&record),
             );
+            let event = &record.event;
 
             match &event.attributes {
-                LedgerEventAttributes::DustInitialUtxo {
-                    generation_info,
-                    generation_index,
-                    ..
-                }
-                | LedgerEventAttributes::DustGenerationDtimeUpdate {
-                    generation_info,
-                    generation_index,
-                    ..
-                } => {
+                // Keyed by night_utxo_hash, NOT generation_index/mt_index: the
+                // latter is recomputed from a merkle tree-insertion path on
+                // DustGenerationDtimeUpdate and does not reproduce the original
+                // leaf's index (verified against real preview data — a
+                // multi-billion garbage value vs. the true ~1000s-range
+                // index), so keying by it would silently leave the original
+                // "active" entry un-updated instead of applying the dtime.
+                // night_utxo_hash is stable across the create/update pair
+                // (confirmed byte-identical), matching the official
+                // chain-indexer's own `UPDATE ... WHERE night_utxo_hash = ?`.
+                LedgerEventAttributes::DustInitialUtxo { generation_info, .. }
+                | LedgerEventAttributes::DustGenerationDtimeUpdate { generation_info, .. } => {
                     let record = DustGenerationRecord {
                         info: generation_info.clone(),
                         tx_id,
                     };
                     batch.insert(
                         &store.dust_generation,
-                        generation_index.to_be_bytes(),
+                        generation_info.night_utxo_hash.0,
                         store::encode(&record),
                     );
                     batch.insert(
                         &store.dust_gen_by_owner,
-                        prefixed_u64_key(&generation_info.owner, *generation_index),
+                        dust_gen_owner_key(&generation_info.owner, &generation_info.night_utxo_hash.0),
                         [],
                     );
                 }
@@ -746,6 +813,15 @@ fn write_block(
     Ok(())
 }
 
+/// dust_gen_by_owner secondary key: owner (variable-length DustPublicKey)
+/// followed by the fixed 32-byte night_utxo_hash primary key.
+fn dust_gen_owner_key(owner: &nightfrost_core::domain::DustPublicKey, night_utxo_hash: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(owner.0.len() + 32);
+    key.extend_from_slice(&owner.0);
+    key.extend_from_slice(night_utxo_hash);
+    key
+}
+
 fn unspent_key(utxo: &UnshieldedUtxo) -> Vec<u8> {
     let mut key = Vec::with_capacity(32 + 32 + 36);
     key.extend_from_slice(&utxo.owner.0);
@@ -812,6 +888,10 @@ fn apply_registration_event(
         DustRegistrationEvent::MappingAdded {
             utxo_id, utxo_index, ..
         } => {
+            // A live NIGHT-utxo mapping IS a valid registration; the common
+            // path emits MappingAdded without a separate Registration event.
+            record.valid = true;
+            record.removed_at_height = None;
             record.utxo_id = Some(utxo_id.clone());
             record.utxo_index = Some(u64::from(*utxo_index));
         }

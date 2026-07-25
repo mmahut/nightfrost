@@ -1,0 +1,18 @@
+[Unit]
+Description=nightfrost indexer ({{ item.network }})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={{ nightfrost_user }}
+Group={{ nightfrost_group }}
+WorkingDirectory={{ nightfrost_root }}
+EnvironmentFile={{ nightfrost_config_dir }}/indexer.env
+ExecStart=/usr/local/bin/nightfrost --node-url {{ item.node_url }} --network-id {{ item.network }} --data-dir {{ nightfrost_root }}/data-{{ item.network }} --listen 127.0.0.1:{{ item.listen_port }}
+Restart=on-failure
+RestartSec=60
+LimitNOFILE=65536
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

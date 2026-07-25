@@ -1,0 +1,10 @@
+---
+- name: Reload systemd for indexers
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart indexers
+  ansible.builtin.systemd:
+    name: "nightfrost-{{ item.network }}.service"
+    state: restarted
+  loop: "{{ nightfrost_indexers }}"

@@ -1,0 +1,63 @@
+---
+- name: Set the production hostname
+  ansible.builtin.hostname:
+    name: "{{ nightfrost_hostname }}"
+
+- name: Install base runtime packages
+  ansible.builtin.package:
+    name:
+      - ca-certificates
+      - curl
+      - tar
+      - xz
+      - policycoreutils
+    state: present
+
+- name: Check firewalld state
+  ansible.builtin.command: firewall-cmd --state
+  register: nightfrost_firewalld_state
+  changed_when: false
+  failed_when: false
+
+- name: Check whether HTTP is allowed through firewalld
+  ansible.builtin.command: firewall-cmd --query-service=http
+  register: nightfrost_firewall_http
+  changed_when: false
+  failed_when: false
+  when: nightfrost_firewalld_state.rc == 0 and nightfrost_firewalld_state.stdout | trim == 'running'
+
+- name: Allow HTTP traffic for Cloudflare and direct HTTP clients
+  ansible.builtin.command: firewall-cmd --permanent --add-service=http
+  when:
+    - nightfrost_firewalld_state.rc == 0
+    - nightfrost_firewalld_state.stdout | trim == 'running'
+    - nightfrost_firewall_http.rc | default(1) != 0
+  notify: Reload firewalld
+
+- name: Create the nightfrost service group
+  ansible.builtin.group:
+    name: "{{ nightfrost_group }}"
+    system: true
+    state: present
+
+- name: Create the nightfrost service account
+  ansible.builtin.user:
+    name: "{{ nightfrost_user }}"
+    group: "{{ nightfrost_group }}"
+    home: "{{ nightfrost_root }}"
+    shell: /sbin/nologin
+    create_home: false
+    system: true
+    state: present
+
+- name: Create shared deployment directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode | default('0755') }}"
+  loop:
+    - path: "{{ nightfrost_root }}"
+    - path: "{{ nightfrost_config_dir }}"
+      mode: "0750"

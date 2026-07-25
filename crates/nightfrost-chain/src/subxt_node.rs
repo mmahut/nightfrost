@@ -67,6 +67,11 @@ const BABE_ENGINE_ID: ConsensusEngineId = [b'B', b'A', b'B', b'E'];
 const CONSENSUS_ENGINE_RUNTIME_API: &str = "ConsensusEngineApi";
 const CATCH_UP_LOG_INTERVAL: u64 = 1_000;
 
+/// Number of blocks fetched-and-made concurrently during catch-up. The node
+/// reads dominate wall clock against a remote RPC; results are consumed in
+/// order regardless.
+const CATCH_UP_CHUNK: u64 = 32;
+
 /// One GRANDPA session worth of blocks. Blocks within this distance of the finalized tip are
 /// fetched by hash (backward traversal) to avoid any risk of ingesting non-canonical blocks.
 /// Blocks further back are fetched by height with parent hash verification.
@@ -137,6 +142,11 @@ impl SubxtNode {
         Ok(hash.0)
     }
 
+    /// The genesis hash of the chain this node serves.
+    pub fn genesis_hash(&self) -> [u8; 32] {
+        self.online_client.genesis_hash().0
+    }
+
     /// A stream of the latest/highest finalized blocks.
     pub async fn highest_blocks(
         &self,
@@ -199,8 +209,17 @@ impl SubxtNode {
                 // Initialize from the stored block hash so the first forward-fetched block
                 // is verified against it too.
                 let mut last_forward_hash = after_height.map(|_| H256(after_hash.0));
-                for height in start_height..safe_height {
-                    if height % CATCH_UP_LOG_INTERVAL == 0 {
+
+                // Fetch-and-make blocks in parallel chunks: the per-block node reads are
+                // network-bound, the results are consumed strictly in order below.
+                // Author derivation depends on the authorities cache, which a NewSession
+                // event invalidates (make_block sets it to None); blocks prefetched after
+                // a session change ran with the stale set, so they are discarded and
+                // refetched — sessions are rare, correctness beats the redundant fetch.
+                let mut height = start_height;
+                while height < safe_height {
+                    let chunk_end = (height + CATCH_UP_CHUNK).min(safe_height);
+                    if height % CATCH_UP_LOG_INTERVAL < CATCH_UP_CHUNK {
                         info!(
                             highest_stored_height = ?after_height,
                             current_height = height,
@@ -208,20 +227,43 @@ impl SubxtNode {
                             "catching up by height"
                         );
                     }
-                    let block = self.block_at_height(height).await?;
-                    let block_hash = block.block_hash();
-                    let made_block = self.make_block(&mut authorities, block).await?;
-                    if let Some(expected_parent) = last_forward_hash
-                        && made_block.parent_hash.0 != expected_parent.0
-                    {
-                        Err(SubxtNodeError::ParentHashMismatch(
-                            height,
-                            expected_parent,
-                            H256(made_block.parent_hash.0),
-                        ))?;
+
+                    let chunk = futures::future::try_join_all((height..chunk_end).map(|h| {
+                        let mut node = self.clone();
+                        let mut chunk_authorities = authorities.clone();
+                        async move {
+                            let block = node.block_at_height(h).await?;
+                            let made_block = node.make_block(&mut chunk_authorities, block).await?;
+                            // None here means this block carried a NewSession event.
+                            Ok::<_, SubxtNodeError>((made_block, chunk_authorities))
+                        }
+                    }))
+                    .await?;
+
+                    for (made_block, chunk_authorities) in chunk {
+                        if let Some(expected_parent) = last_forward_hash
+                            && made_block.parent_hash.0 != expected_parent.0
+                        {
+                            Err(SubxtNodeError::ParentHashMismatch(
+                                made_block.height,
+                                expected_parent,
+                                H256(made_block.parent_hash.0),
+                            ))?;
+                        }
+                        last_forward_hash = Some(H256(made_block.hash.0));
+                        height = made_block.height + 1;
+                        let session_changed = chunk_authorities.is_none();
+                        if authorities.is_none() {
+                            authorities = chunk_authorities;
+                        }
+                        yield made_block;
+                        if session_changed {
+                            // Later blocks in this chunk used the stale authority set:
+                            // drop them and refetch from the next height.
+                            authorities = None;
+                            break;
+                        }
                     }
-                    last_forward_hash = Some(block_hash);
-                    yield made_block;
                 }
 
                 let stop_hash = last_forward_hash.unwrap_or(H256(after_hash.0));
@@ -448,17 +490,24 @@ impl SubxtNode {
             .transpose()?
             .flatten();
 
-        let zswap_merkle_tree_root =
-            runtimes::get_zswap_merkle_tree_root(state_node_version, &block).await?;
+        // The three per-block node reads are independent: fetch them concurrently.
+        // ledger_state_root is fetched for EVERY block (the official indexer only
+        // fetches it at genesis): with proof verification off, the per-block
+        // ledger-state-root comparison is the replay's correctness oracle.
+        let (zswap_merkle_tree_root, block_details, ledger_state_root) = tokio::try_join!(
+            runtimes::get_zswap_merkle_tree_root(state_node_version, &block),
+            runtimes::make_block_details(authorities, content_node_version, &block),
+            runtimes::get_ledger_state_root(state_node_version, &block),
+        )?;
         let zswap_merkle_tree_root =
             ZswapMerkleTreeRoot::deserialize(zswap_merkle_tree_root, ledger_version)?;
-
+        let ledger_state_root = ledger_state_root.map(Into::into);
         let BlockDetails {
             timestamp,
             transactions,
             mut dust_registration_events,
             bridge_events,
-        } = runtimes::make_block_details(authorities, content_node_version, &block).await?;
+        } = block_details;
 
         // At genesis, Substrate does not emit events (Parity PR #5463). Fetch cNight
         // registrations from pallet storage instead.
@@ -467,13 +516,6 @@ impl SubxtNode {
                 runtimes::fetch_genesis_cnight_registrations(state_node_version, &block).await?;
             dust_registration_events.extend(genesis_registrations);
         }
-
-        // Fetched for EVERY block (the official indexer only fetches it at genesis):
-        // with proof verification off, the per-block ledger-state-root comparison is
-        // the replay's correctness oracle.
-        let ledger_state_root = runtimes::get_ledger_state_root(state_node_version, &block)
-            .await?
-            .map(Into::into);
 
         let transactions = stream::iter(transactions)
             .then(|t| make_transaction(t, protocol_version, state_node_version, &block))

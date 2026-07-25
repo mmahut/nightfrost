@@ -2,3 +2,10 @@
 /data
 sync.log
 nohup.out
+
+# Local production deployment inputs; never commit credentials.
+/ops/inventory/production/group_vars/vault.yml
+
+# Prebuilt midnight-node binaries staged for deployment (~1GB+ each); these
+# are deployment inputs fetched/built locally, not sources to track.
+/ops/artifacts/

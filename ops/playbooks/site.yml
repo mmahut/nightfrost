@@ -1,0 +1,53 @@
+---
+- name: Deploy the nightfrost production indexer
+  hosts: indexers
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - "{{ playbook_dir }}/../inventory/production/group_vars/vault.yml"
+
+  vars:
+    # These are controller-side paths. The release binary is built from the
+    # repository checkout and copied to the production host.
+    nightfrost_binary_source: "{{ playbook_dir }}/../../target/release/nightfrost"
+    nightfrost_explorer_source: "{{ playbook_dir }}/../../examples/explorer/dist"
+    # landing and docs are hand-authored static files, not build artifacts,
+    # so their source is copied directly with no build step.
+    nightfrost_landing_source: "{{ playbook_dir }}/../landing"
+    nightfrost_docs_source: "{{ playbook_dir }}/../docs"
+
+  pre_tasks:
+    - name: Inspect the locally built binary format
+      ansible.builtin.command:
+        cmd: file -b "{{ nightfrost_binary_source }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      register: local_binary_format
+
+    - name: Require a Linux x86_64 release binary before changing the host
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.system == 'Linux'
+          - ansible_facts.architecture in ['x86_64', 'amd64']
+          - "'ELF 64-bit' in local_binary_format.stdout"
+          - "'x86-64' in local_binary_format.stdout or 'x86_64' in local_binary_format.stdout"
+        fail_msg: >-
+          The production host is Linux x86_64, but the local release binary is
+          {{ local_binary_format.stdout }}. Build with ops/build-linux.sh.
+
+    - name: Require the production secrets
+      ansible.builtin.assert:
+        that:
+          - nightfrost_cursor_secret is defined
+          - nightfrost_cursor_secret | default('') | length >= 32
+          - nightfrost_cursor_secret is not match('^REPLACE_')
+        fail_msg: >-
+          Copy group_vars/vault.yml.example to vault.yml, fill in the cursor
+          secret, and encrypt it with ansible-vault.
+
+  roles:
+    - common
+    - nightfrost_indexer
+    - nginx

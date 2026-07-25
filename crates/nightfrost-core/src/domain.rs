@@ -479,6 +479,38 @@ impl LedgerEvent {
     }
 }
 
+/// Pair a ledger event with the id of the emitting `ContractCall` by matching
+/// `(contract_address, entry_point)` against the contract actions of the same
+/// transaction — the exact semantics of the official chain-indexer's
+/// `correlate_contract_action_ids` (chain-indexer/src/infra/storage.rs, ticket
+/// #1162). Only an unambiguous match is attributed: if several calls in the
+/// same transaction share address and entry point, the event stays
+/// unattributed (`None`) rather than risking wrong attribution. Zswap and
+/// dust events map to `None`.
+pub fn correlate_contract_action_id<'a>(
+    event: &LedgerEvent,
+    actions: impl IntoIterator<Item = (u64, &'a SerializedContractAddress, &'a ContractAttributes)>,
+) -> Option<u64> {
+    let contract_address = event.contract_address.as_ref()?;
+    let entry_point = event.attributes.contract_entry_point()?;
+
+    let mut matched = None;
+    for (action_id, address, attributes) in actions {
+        let is_match = matches!(
+            attributes,
+            ContractAttributes::Call { entry_point: action_entry_point }
+                if action_entry_point.as_bytes() == entry_point.as_ref()
+        ) && address == contract_address;
+        if is_match {
+            if matched.is_some() {
+                return None; // ambiguous: leave unattributed
+            }
+            matched = Some(action_id);
+        }
+    }
+    matched
+}
+
 /// Every field name `LedgerEvent::indexable_contract_fields` can emit; the closed set of valid
 /// `fieldName` values for the contract events field-prefix filter.
 pub const INDEXABLE_CONTRACT_FIELD_NAMES: [&str; 7] = [

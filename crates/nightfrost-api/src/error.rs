@@ -1,8 +1,8 @@
 use axum::{Json, http::StatusCode, response::IntoResponse};
 use serde::Serialize;
 
-/// Blockfrost-style error envelope.
-#[derive(Serialize)]
+/// Error envelope.
+#[derive(Debug, Serialize)]
 pub struct ApiError {
     pub status_code: u16,
     pub error: String,
@@ -26,6 +26,14 @@ impl ApiError {
         }
     }
 
+    pub fn gone(message: impl Into<String>) -> Self {
+        Self {
+            status_code: 410,
+            error: "Gone".into(),
+            message: message.into(),
+        }
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             status_code: 500,
@@ -37,7 +45,8 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let status = StatusCode::from_u16(self.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status =
+            StatusCode::from_u16(self.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         (status, Json(self)).into_response()
     }
 }

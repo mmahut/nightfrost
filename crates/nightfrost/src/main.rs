@@ -1,3 +1,5 @@
+mod backfill;
+
 use anyhow::Context;
 use clap::Parser;
 use nightfrost_api::routes::ApiState;
@@ -9,7 +11,7 @@ use std::sync::Arc;
 const LEDGER_CACHE_MAX_NODES: usize = 10_000;
 
 #[derive(Parser)]
-#[command(name = "nightfrost", about = "Light Midnight indexer with a Blockfrost-style REST API")]
+#[command(name = "nightfrost", about = "Midnight blockchain indexer with a REST API")]
 struct Args {
     /// Midnight node WebSocket RPC URL (must be an archive node for from-genesis sync)
     #[arg(long, env = "NIGHTFROST_NODE_URL", default_value = "wss://rpc.preview.midnight.network")]
@@ -26,24 +28,50 @@ struct Args {
     /// Listen address for the REST API
     #[arg(long, env = "NIGHTFROST_LISTEN", default_value = "127.0.0.1:3000")]
     listen: String,
+
+    /// HMAC secret for opaque pagination cursors. Set the same value on every
+    /// API replica and retain it across storage/backend migrations.
+    #[arg(long, env = "NIGHTFROST_CURSOR_SECRET")]
+    cursor_secret: Option<String>,
+
+    /// One-off maintenance: correlate already-indexed contract events with
+    /// their emitting contract calls and populate the per-contract event
+    /// index, then exit. Run with the indexer stopped; idempotent.
+    #[arg(long)]
+    backfill_contract_events: bool,
+
+    /// One-off maintenance: rebuild the dust generation index keyed by
+    /// night_utxo_hash instead of the ledger's unstable recomputed
+    /// generation_index, then exit. Run with the indexer stopped; idempotent.
+    #[arg(long)]
+    backfill_dust_generation: bool,
 }
 
-/// POST /api/v1/tx/submit — body: hex (optionally 0x-prefixed) or raw bytes of
-/// a serialized ledger transaction; proxied to the node as an unsigned
-/// `Midnight.send_mn_transaction` extrinsic.
+/// POST /api/v0/tx/submit — a serialized ledger transaction, proxied to the
+/// node as an unsigned `Midnight.send_mn_transaction` extrinsic. The body is
+/// raw bytes when Content-Type is application/octet-stream, hex (optionally
+/// 0x-prefixed) otherwise — never guessed from the payload, which would
+/// corrupt raw bodies that happen to be valid hex text.
 async fn submit_tx(
     axum::extract::State(node): axum::extract::State<SubxtNode>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::Json<serde_json::Value>, nightfrost_api::error::ApiError> {
     use nightfrost_api::error::ApiError;
 
-    let raw = match std::str::from_utf8(&body) {
-        Ok(text) => {
-            let text = text.trim();
-            let text = text.strip_prefix("0x").unwrap_or(text);
-            const_hex::decode(text).map_err(|_| ApiError::bad_request("invalid hex body"))?
-        }
-        Err(_) => body.to_vec(),
+    let is_binary = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/octet-stream"));
+
+    let raw = if is_binary {
+        body.to_vec()
+    } else {
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| ApiError::bad_request("expected hex body (or Content-Type: application/octet-stream for raw bytes)"))?
+            .trim();
+        let text = text.strip_prefix("0x").unwrap_or(text);
+        const_hex::decode(text).map_err(|_| ApiError::bad_request("invalid hex body"))?
     };
 
     let hash = node
@@ -72,6 +100,33 @@ async fn main() -> anyhow::Result<()> {
         .context("invalid network id (must be non-empty lowercase)")?;
 
     let store = Arc::new(Store::open(&args.data_dir).context("open fjall keyspace")?);
+
+    if args.backfill_contract_events {
+        let counts = backfill::backfill_contract_events(&store)
+            .context("backfill per-contract events")?;
+        tracing::info!(?counts, "contract-event backfill finished");
+        println!(
+            "backfill done: {} events scanned, {} contract events indexed, \
+             {} correlated to a contract call, {} event records rewritten",
+            counts.events_scanned,
+            counts.contract_events_indexed,
+            counts.events_correlated,
+            counts.records_rewritten,
+        );
+        return Ok(());
+    }
+
+    if args.backfill_dust_generation {
+        let counts = backfill::backfill_dust_generation(&store)
+            .context("backfill dust generation index")?;
+        tracing::info!(?counts, "dust-generation backfill finished");
+        println!(
+            "backfill done: rebuilt={}, {} events scanned, {} generation entries written",
+            counts.rebuilt, counts.events_scanned, counts.generation_entries_written,
+        );
+        return Ok(());
+    }
+
     ledger_db::init(
         LEDGER_CACHE_MAX_NODES,
         ledger_db::FjallLedgerDb::new(
@@ -96,14 +151,19 @@ async fn main() -> anyhow::Result<()> {
         highest_block.clone(),
     ));
 
+    let cursor_key = args.cursor_secret.unwrap_or_else(|| {
+        tracing::warn!("NIGHTFROST_CURSOR_SECRET is unset; using a deterministic development key");
+        format!("nightfrost-development-cursor-key:{}", args.network_id)
+    });
     let state = Arc::new(ApiState {
         store,
         network_id: args.network_id,
         node_url: args.node_url,
         highest_block,
+        cursor_codec: nightfrost_api::pagination::CursorCodec::new(cursor_key),
     });
     let submit_router = axum::Router::new()
-        .route("/api/v1/tx/submit", axum::routing::post(submit_tx))
+        .route("/api/v0/tx/submit", axum::routing::post(submit_tx))
         .with_state(submit_node);
     let app = nightfrost_api::router(state).merge(submit_router);
     let listener = tokio::net::TcpListener::bind(&args.listen)

@@ -39,6 +39,7 @@ midnight-zswap_v9            = { package = "midnight-zswap", version = "9" }
 anyhow             = { version = "1.0" }
 async-stream       = { version = "0.3" }
 axum               = { version = "0.8" }
+base64             = { version = "0.22" }
 bech32             = { version = "0.12" }
 clap               = { version = "4.6" }
 const-hex          = { version = "1.18" }
@@ -46,6 +47,7 @@ derive_more        = { version = "2.1" }
 fjall              = { version = "2" }
 futures            = { version = "0.3" }
 http               = { version = "1" }
+hmac               = { version = "0.13" }
 itertools          = { version = "0.15" }
 parity-scale-codec = { version = "3.7" }
 postcard           = { version = "1", features = ["use-std"] }
@@ -53,8 +55,10 @@ serde              = { version = "1.0" }
 serde_json         = { version = "1.0" }
 sha2               = { version = "0.11" }
 subxt              = { version = "0.50" }
+subtle             = { version = "2.6" }
 thiserror          = { version = "2.0" }
 tokio              = { version = "1" }
+tower-http         = { version = "0.7", features = ["cors"] }
 tracing            = { version = "0.1" }
 tracing-subscriber = { version = "0.3" }
 

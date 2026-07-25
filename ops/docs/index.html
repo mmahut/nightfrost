@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="API reference for the Midnight API: blocks, transactions, addresses, contracts, DUST generation and the ledger-event feed." />
+    <title>Midnight API reference</title>
+    <style>
+      * { box-sizing: border-box; }
+      html, body { margin: 0; background: #0a0f1e; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+        color: #dbe7f0;
+      }
+
+      /* nightfrost masthead, consistent with the rest of the site. This
+         page is intentionally dark-only: Redoc's theme is fixed at init,
+         so it can't follow a light/dark toggle without a full re-render. */
+      .site-header {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        height: 58px;
+        padding: 0 22px;
+        border-bottom: 1px solid #24304a;
+      }
+      .logo {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        color: #dbe7f0;
+        text-decoration: none;
+        flex-shrink: 0;
+      }
+      .logo svg { width: 26px; height: 26px; color: #dbe7f0; }
+      .logo-word { font-weight: 650; font-size: 1.02rem; letter-spacing: 0.02em; }
+      .site-nav { margin-left: auto; display: flex; align-items: center; gap: 22px; font-size: 0.88rem; }
+      .site-nav a { color: #7e90ab; text-decoration: none; }
+      .site-nav a:hover { color: #8fd0e4; }
+      .site-nav a.spec-link {
+        color: #8fd0e4;
+        border: 1px solid #2a4256;
+        border-radius: 4px;
+        padding: 5px 12px;
+      }
+      .site-nav a.spec-link:hover { background: rgba(143, 208, 228, 0.12); }
+
+      #loading {
+        position: fixed;
+        inset: 58px 0 0 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #7e90ab;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="logo" href="https://nightfrost.dev" aria-label="nightfrost home">
+        <svg viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg"><g stroke="currentColor" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="38,8 48,22 58,8"/><polyline points="38,8 48,22 58,8" transform="rotate(60 48 48)"/><polyline points="38,8 48,22 58,8" transform="rotate(120 48 48)"/><polyline points="38,8 48,22 58,8" transform="rotate(180 48 48)"/><polyline points="38,8 48,22 58,8" transform="rotate(240 48 48)"/><polyline points="38,8 48,22 58,8" transform="rotate(300 48 48)"/></g><circle cx="48" cy="48" r="10" fill="#8fd0e4"/></svg>
+        <span class="logo-word">night<span style="color: #8fd0e4">frost</span></span>
+      </a>
+      <nav class="site-nav">
+        <a href="https://nightfrost.dev">Home</a>
+        <a href="https://explorer.nightfrost.dev">Explorer</a>
+        <a class="spec-link" href="./openapi.yaml" download>Download spec</a>
+      </nav>
+    </header>
+
+    <div id="loading">Loading API reference...</div>
+    <div id="redoc-container"></div>
+    <script src="https://cdn.redocly.com/redoc/latest/bundles/redoc.standalone.js"></script>
+    <script>
+      Redoc.init(
+        './openapi.yaml',
+        {
+          hideDownloadButton: true,
+          expandResponses: '200,201',
+          pathInMiddlePanel: true,
+          theme: {
+            spacing: { sectionVertical: 32 },
+            colors: {
+              primary: { main: '#8fd0e4' },
+              success: { main: '#6fdc9c' },
+              warning: { main: '#e8c268' },
+              error: { main: '#f08a8a' },
+              text: { primary: '#dbe7f0', secondary: '#7e90ab' },
+              border: { dark: '#24304a', light: '#24304a' },
+              http: {
+                get: '#6fdc9c',
+                post: '#8fd0e4',
+                put: '#e8c268',
+                delete: '#f08a8a',
+              },
+            },
+            sidebar: {
+              backgroundColor: '#111a30',
+              textColor: '#dbe7f0',
+              activeTextColor: '#8fd0e4',
+              groupItems: { activeBackgroundColor: '#0e1628' },
+              level1Items: { activeBackgroundColor: '#0e1628' },
+              spacing: { unit: 5 },
+            },
+            rightPanel: {
+              backgroundColor: '#0d1424',
+              textColor: '#dbe7f0',
+            },
+            typography: {
+              fontSize: '15px',
+              fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif",
+              smoothing: 'antialiased',
+              headings: {
+                fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif",
+                fontWeight: '650',
+              },
+              code: {
+                fontFamily: "ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace",
+                color: '#8fd0e4',
+                backgroundColor: 'rgba(143, 208, 228, 0.08)',
+              },
+              links: { color: '#8fd0e4', hover: '#a8ddec' },
+            },
+            codeBlock: { backgroundColor: '#0a0f1e' },
+          },
+        },
+        document.getElementById('redoc-container'),
+        function () {
+          var loading = document.getElementById('loading');
+          if (loading) loading.remove();
+        },
+      );
+    </script>
+  </body>
+</html>
