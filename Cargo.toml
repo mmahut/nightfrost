@@ -66,6 +66,10 @@ tracing-subscriber = { version = "0.3" }
 # (v8/v9 coexistence shape traces to midnight-ledger#580). The rc crates aren't
 # on crates.io yet, hence git tags.
 [patch.crates-io]
+# fjall 2.11.2 vendored with added journal-eviction/recovery diagnostics
+# (PATCHED(nightfrost) markers) after a production write-halt livelock;
+# drop when upgrading to fjall 3, which rewrote the stall bookkeeping.
+fjall                         = { path = "vendor/fjall" }
 midnight-base-crypto          = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "base-crypto-1.1.0-rc.2" }
 midnight-base-crypto-derive   = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "base-crypto-derive-1.1.0-rc.2" }
 midnight-serialize            = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "serialize-1.2.0-rc.1" }

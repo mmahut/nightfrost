@@ -10,15 +10,28 @@ use std::sync::Arc;
 pub async fn metrics(State(state): State<Arc<ApiState>>) -> Result<String, ApiError> {
     let indexed_height = state.store.last_indexed_height().map_err(internal)?;
     let node_height = *state.highest_block.read().expect("lock highest block");
-    let caught_up = matches!((indexed_height, node_height), (Some(i), Some(n)) if n.saturating_sub(i) <= 10);
-    let txs = state.store.next_id(meta_keys::NEXT_TX_ID).map_err(internal)?;
-    let actions = state.store.next_id(meta_keys::NEXT_ACTION_ID).map_err(internal)?;
-    let events = state.store.next_id(meta_keys::NEXT_EVENT_ID).map_err(internal)?;
+    let caught_up =
+        matches!((indexed_height, node_height), (Some(i), Some(n)) if n.saturating_sub(i) <= 10);
+    let txs = state
+        .store
+        .next_id(meta_keys::NEXT_TX_ID)
+        .map_err(internal)?;
+    let actions = state
+        .store
+        .next_id(meta_keys::NEXT_ACTION_ID)
+        .map_err(internal)?;
+    let events = state
+        .store
+        .next_id(meta_keys::NEXT_EVENT_ID)
+        .map_err(internal)?;
     let disk = state.store.keyspace.disk_space();
 
     let mut out = String::with_capacity(1024);
     let mut gauge = |name: &str, help: &str, value: f64| {
-        let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}");
+        let _ = writeln!(
+            out,
+            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"
+        );
     };
 
     gauge(

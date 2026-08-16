@@ -41,11 +41,13 @@ fn parse_addr32(input: &str) -> Result<[u8; 32], ApiError> {
 
 #[derive(Serialize)]
 pub struct TxResponse {
+    pub id: u64,
     pub hash: String,
     pub block_height: u64,
     pub block_hash: String,
     pub block_time: u64,
     pub index: u32,
+    pub protocol_version: u32,
     pub variant: TransactionVariant,
     pub status: String,
     pub segments: Option<Vec<(u16, bool)>>,
@@ -88,11 +90,7 @@ fn tx_by_hash(state: &AppState, hash: &str) -> Result<(u64, TxRecord), ApiError>
     Ok((tx_id, record))
 }
 
-pub async fn tx(
-    State(state): State<AppState>,
-    Path(hash): Path<String>,
-) -> Result<Json<PointResponse<TxResponse>>, ApiError> {
-    let (_, record) = tx_by_hash(&state, &hash)?;
+fn tx_response(state: &AppState, tx_id: u64, record: TxRecord) -> Result<TxResponse, ApiError> {
     let block = state
         .store
         .block(record.block_height)
@@ -100,30 +98,58 @@ pub async fn tx(
         .ok_or_else(|| ApiError::internal("missing block for tx"))?;
     let (status, segments) = tx_status(&record.result);
 
-    response(
-        &state,
-        TxResponse {
-            hash: const_hex::encode(record.hash),
-            block_height: record.block_height,
-            block_hash: const_hex::encode(block.hash),
-            block_time: block.timestamp,
-            index: record.index_in_block,
-            variant: record.variant,
-            status,
-            segments,
-            paid_fees: record.paid_fees.to_string(),
-            estimated_fees: record.estimated_fees.to_string(),
-            identifiers: record
-                .identifiers
-                .iter()
-                .map(|i| const_hex::encode(i))
-                .collect(),
-            utxo_created_count: record.created_utxos.len(),
-            utxo_spent_count: record.spent_utxos.len(),
-            event_count: record.event_count,
-            contract_action_count: record.contract_action_ids.len(),
-        },
-    )
+    Ok(TxResponse {
+        id: tx_id,
+        hash: const_hex::encode(record.hash),
+        block_height: record.block_height,
+        block_hash: const_hex::encode(block.hash),
+        block_time: block.timestamp,
+        index: record.index_in_block,
+        protocol_version: block.protocol_version,
+        variant: record.variant,
+        status,
+        segments,
+        paid_fees: record.paid_fees.to_string(),
+        estimated_fees: record.estimated_fees.to_string(),
+        identifiers: record.identifiers.iter().map(const_hex::encode).collect(),
+        utxo_created_count: record.created_utxos.len(),
+        utxo_spent_count: record.spent_utxos.len(),
+        event_count: record.event_count,
+        contract_action_count: record.contract_action_ids.len(),
+    })
+}
+
+pub async fn tx(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> Result<Json<PointResponse<TxResponse>>, ApiError> {
+    let (tx_id, record) = tx_by_hash(&state, &hash)?;
+    response(&state, tx_response(&state, tx_id, record)?)
+}
+
+pub async fn tx_by_identifier(
+    State(state): State<AppState>,
+    Path(identifier): Path<String>,
+) -> Result<Json<PointResponse<TxResponse>>, ApiError> {
+    let identifier = const_hex::decode(identifier.trim_start_matches("0x"))
+        .map_err(|_| ApiError::bad_request("invalid transaction identifier"))?;
+    if identifier.len() != 32 {
+        return Err(ApiError::bad_request(
+            "transaction identifier must be 32 bytes",
+        ));
+    }
+    let tx_id = state
+        .store
+        .tx_ids_by_identifier(&identifier)
+        .map_err(internal)?
+        .pop()
+        .ok_or_else(|| ApiError::not_found("transaction not found"))?;
+    let record = state
+        .store
+        .tx(tx_id)
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::not_found("transaction not found"))?;
+    response(&state, tx_response(&state, tx_id, record)?)
 }
 
 #[derive(Serialize)]
@@ -201,18 +227,26 @@ pub struct EventResponse {
     pub raw: String,
     pub tx_id: u64,
     pub block_height: u64,
+    pub protocol_version: u32,
 }
 
 impl EventResponse {
-    fn new(id: u64, record: EventRecord) -> Self {
-        Self {
+    fn new(state: &AppState, id: u64, record: EventRecord) -> Result<Self, ApiError> {
+        let protocol_version = state
+            .store
+            .block(record.block_height)
+            .map_err(internal)?
+            .ok_or_else(|| ApiError::internal("missing block for ledger event"))?
+            .protocol_version;
+        Ok(Self {
             id,
             grouping: record.event.grouping,
             raw: const_hex::encode(&record.event.raw),
             attributes: record.event.attributes,
             tx_id: record.tx_id,
             block_height: record.block_height,
-        }
+            protocol_version,
+        })
     }
 }
 
@@ -223,13 +257,13 @@ pub async fn tx_events(
     let (_, record) = tx_by_hash(&state, &hash)?;
     let events = (record.first_event_id..record.first_event_id + record.event_count as u64)
         .map(|event_id| {
-            state
+            let value = state
                 .store
                 .ledger_events
                 .get(event_id.to_be_bytes())
                 .map_err(internal)?
-                .map(|v| EventResponse::new(event_id, store::decode(&v)))
-                .ok_or_else(|| ApiError::internal("missing event record"))
+                .ok_or_else(|| ApiError::internal("missing event record"))?;
+            EventResponse::new(&state, event_id, store::decode(&value))
         })
         .collect::<Result<Vec<_>, _>>()?;
     response(&state, events)
@@ -352,7 +386,7 @@ async fn address_utxos_inner(
         &state,
         &query_scope,
         page.anchor.as_ref(),
-        cursor_position.as_ref().map(|position| position.as_slice()),
+        cursor_position.as_deref(),
         has_more,
     );
     response_at(&state, utxos, page.anchor, cursor)
@@ -361,10 +395,14 @@ async fn address_utxos_inner(
 pub async fn address_txs(
     State(state): State<AppState>,
     Path(addr): Path<String>,
+    Query(from): Query<EventFrom>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
     let owner = parse_addr32(&addr)?;
-    let query_scope = scope(&[b"address_txs", &owner], pagination.order);
+    let query_scope = scope(
+        &[b"address_txs", &owner, &from.from.to_be_bytes()],
+        pagination.order,
+    );
     let page = page_context(&state, &pagination, &query_scope)?;
     let cursor_key = page
         .position
@@ -380,7 +418,11 @@ pub async fn address_txs(
         .transpose()?;
     let lower = match (pagination.order, cursor_key.as_ref()) {
         (Order::Asc, Some(key)) => Bound::Excluded(key.clone()),
-        _ => Bound::Included(owner.to_vec()),
+        _ => {
+            let mut key = owner.to_vec();
+            key.extend_from_slice(&from.from.to_be_bytes());
+            Bound::Included(key)
+        }
     };
     let upper = match (pagination.order, cursor_key) {
         (Order::Desc, Some(key)) => Bound::Excluded(key),
@@ -451,6 +493,9 @@ pub struct ContractResponse {
     pub latest_action_id: u64,
     pub latest_action_type: String,
     pub latest_block_height: u64,
+    /// Content hash of the latest state: poll this cheap endpoint and fetch
+    /// the state blob only when it changes.
+    pub state_hash: Option<String>,
     pub balances: Vec<BalanceResponse>,
 }
 
@@ -484,6 +529,7 @@ pub async fn contract(
             latest_action_id: record.latest_action_id,
             latest_action_type: action_type(&latest),
             latest_block_height: latest.block_height,
+            state_hash: latest.state_hash.map(const_hex::encode),
             balances: latest
                 .balances
                 .iter()
@@ -576,12 +622,22 @@ pub async fn contract_state(
         .ok_or_else(|| ApiError::not_found("contract not found"))?;
     let latest = contract_action(&state, record.latest_action_id)?;
 
+    let state_hash = latest
+        .state_hash
+        .ok_or_else(|| internal("latest contract action has no state"))?;
+    let blob = state
+        .store
+        .contract_states
+        .get(state_hash)
+        .map_err(internal)?
+        .ok_or_else(|| internal("contract state blob missing for hash"))?;
+
     response(
         &state,
         ContractStateResponse {
             address: const_hex::encode(&address),
             block_height: latest.block_height,
-            state: const_hex::encode(&latest.state),
+            state: const_hex::encode(&blob),
         },
     )
 }
@@ -593,6 +649,10 @@ pub struct ContractActionResponse {
     pub entry_point: Option<String>,
     pub tx_hash: String,
     pub block_height: u64,
+    /// Content hash of the block-final state stored for this action; None for
+    /// a failed action. Lets clients page history and fetch only the states
+    /// that actually changed.
+    pub state_hash: Option<String>,
 }
 
 pub async fn contract_actions(
@@ -664,6 +724,7 @@ pub async fn contract_actions(
                 entry_point,
                 tx_hash: const_hex::encode(tx.hash),
                 block_height: record.block_height,
+                state_hash: record.state_hash.map(const_hex::encode),
             },
         ));
         if actions.len() > pagination.count {
@@ -843,7 +904,7 @@ pub async fn ledger_events(
         {
             continue;
         }
-        events.push(EventResponse::new(id, record));
+        events.push(EventResponse::new(&state, id, record)?);
         if events.len() > pagination.count {
             break;
         }

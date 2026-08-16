@@ -23,8 +23,8 @@ include!(concat!(env!("OUT_DIR"), "/generated_runtime.rs"));
 
 use crate::subxt_node::{OnlineClientAtBlock, SubxtNodeError};
 use nightfrost_core::domain::{
-    ByteVec, NodeVersion, SerializedContractAddress, SerializedContractState,
-    bridge::BridgeEvent, dust::DustRegistrationEvent,
+    ByteVec, NodeVersion, SerializedContractAddress, SerializedContractState, bridge::BridgeEvent,
+    dust::DustRegistrationEvent,
 };
 
 /// Runtime specific block details.

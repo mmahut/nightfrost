@@ -171,7 +171,11 @@ impl SubxtNode {
         let (after_hash, after_height) = after
             .map(|BlockRef { hash, height }| (hash, height))
             .unzip();
-        debug!(?after_hash, ?after_height, "subscribing to finalized blocks");
+        debug!(
+            ?after_hash,
+            ?after_height,
+            "subscribing to finalized blocks"
+        );
 
         let after_hash = after_hash.unwrap_or_default();
         let mut authorities = None;

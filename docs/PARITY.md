@@ -1,7 +1,7 @@
 # Parity with midnight-indexer
 
 Tracks what the official midnight-indexer (GraphQL `/api/v4`, schema-v4 @ 4.3.5) serves
-versus what nightfrost serves (REST `/api/v0`). Status as of 2026-08-05.
+versus what nightfrost serves (REST `/api/v0`). Status as of 2026-08-15.
 
 Legend: ✅ served · 📥 data indexed, endpoint pending · 🔶 partial · 🚫 out of scope by design
 
@@ -10,7 +10,7 @@ Legend: ✅ served · 📥 data indexed, endpoint pending · 🔶 partial · �
 | midnight-indexer | nightfrost | Status |
 |---|---|---|
 | `block(offset)` by hash/height | `GET /blocks/{hash\|height}`, `/blocks/latest`, `/blocks/{id}/txs` | ✅ |
-| `transactions(offset)` by hash/identifier | `GET /txs/{hash}` (+`/utxos`, `/events`); by identifier: index stored (`txs_by_identifier`) | 🔶 endpoint for identifier lookup pending |
+| `transactions(offset)` by hash/identifier | `GET /txs/{hash}` (+`/utxos`, `/events`) and `GET /tx-identifiers/{identifier}` | ✅ |
 | `contract(address)` / `contractAction(address, offset)` | `GET /contracts/{addr}`, `/state`, `/actions` | ✅ |
 | `contractEvents(filter)` | `GET /contracts/{addr}/events?from=&count=` — correlated to the emitting `ContractCall` like the official indexer (ticket #1162 semantics); verified against the oracle (currently 0 events either side — preview is ledger v8, MIP-107 events need v9) | ✅ |
 | `dustGenerationStatus(addresses)` | `GET /dust/generation-status/{stake_key}` (hex or bech32); capacity/rate math ported from indexer-api's dust.rs, verified against the oracle (401 comparisons, 2 residual — see note below) | ✅ |
@@ -50,6 +50,8 @@ nightfrost is poll-based REST; the cursor feed substitutes for some streams.
 - `GET /addresses/{addr}` — balances per token type (official offers no balance query at all)
 - `GET /addresses/{addr}/utxos[/{token_type}]` — point-in-time unspent set (official only streams)
 - `GET /txs/{hash}/utxos` — inputs/outputs view
+- `GET /tx-identifiers/{identifier}` — direct ledger-identifier lookup
+- `GET /ledger-parameters/latest` — authoritative tagged parameters for local wallet fee calculation
 - `GET /sync-status` with percentage
 - `POST /tx/submit`
 
@@ -70,7 +72,7 @@ further; the affected keys are in `tests/differential/report.json`.
 
 ## Data indexed but not yet exposed (no resync needed to expose)
 
-tx-by-identifier lookup · nullifier prefix index · bridge event/claim partitions.
+nullifier prefix index · bridge event/claim partitions.
 
 ## REST proposals for the partial / out-of-scope surfaces
 
@@ -81,7 +83,6 @@ conventions (path filters, cursor queries, `?count&page&order`).
 
 | Proposed endpoint | Serves | Notes |
 |---|---|---|
-| `GET /txs/identifier/{identifier}` | tx hashes for a transaction identifier | direct read of `txs_by_identifier` |
 | `GET /dust/generations/{dust_address}` | generation info rows for an owner | reads `dust_gen_by_owner` |
 | `GET /nullifiers/{hex_prefix}/txs` | tx/block refs whose events carry a nullifier with this prefix | REST twin of `shieldedNullifierTransactions`/`dustNullifierTransactions` — stateless, no viewing keys; needs a nullifier→event index (backfillable) |
 | `GET /bridge/events[?from=]` · `GET /bridge/balance` · `GET /bridge/deposits/{recipient}` | c2m-bridge activity | events are already decoded per block; persist them to their own partition first |
@@ -107,9 +108,9 @@ each stream is "range-scan from cursor, then wake on new block".
 
 - **Shielded wallet sync** (`connect`/`disconnect`, `shieldedTransactions`):
   server-side trial decryption of viewing keys is inherently session-stateful and
-  custodial — it does not want to be REST. The REST-native answer is the
-  *stateless* pair above (nullifier prefix lookup + the raw ledger-event stream),
-  with decryption and merkle-witness building on the client. Wallets that need
+  custodial — it does not want to be REST. The raw ledger-event feed now supports
+  client-side replay, as demonstrated by `examples/light-wallet`, with trial
+  processing and merkle-witness building in the browser. Wallets that need
   `zswapMerkleTreeCollapsedUpdate` would additionally need
   `GET /zswap/merkle-update?start=&end=` — possible (re-vendor the collapsed-update
   makers we dropped), but it drags the wallet-sync tier back in; only worth it if

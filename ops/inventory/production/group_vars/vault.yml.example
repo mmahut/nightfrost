@@ -1,8 +1,0 @@
-# Copy this file to vault.yml, replace every value, then encrypt it:
-#
-#   cp vault.yml.example vault.yml
-#   ansible-vault encrypt vault.yml
-#
-# Keep the same cursor secret across deployments. A 64-character hex value is
-# a convenient format for this environment-file based deployment.
-nightfrost_cursor_secret: REPLACE_WITH_A_LONG_RANDOM_HEX_SECRET

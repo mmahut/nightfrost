@@ -76,9 +76,7 @@ impl DB for FjallLedgerDb {
     }
 
     fn delete_node(&mut self, key: &ArenaHash<Self::Hasher>) {
-        self.nodes
-            .remove(&key.0[..])
-            .expect("cannot delete node");
+        self.nodes.remove(&key.0[..]).expect("cannot delete node");
     }
 
     fn batch_update<I>(&mut self, updates: I)
@@ -206,7 +204,9 @@ mod tests {
 
     fn test_db() -> (tempfile::TempDir, FjallLedgerDb) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let keyspace = fjall::Config::new(dir.path()).open().expect("open keyspace");
+        let keyspace = fjall::Config::new(dir.path())
+            .open()
+            .expect("open keyspace");
         let nodes = keyspace
             .open_partition("ledger_db_nodes", Default::default())
             .expect("open nodes");

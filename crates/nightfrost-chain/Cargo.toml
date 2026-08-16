@@ -16,6 +16,7 @@ futures            = { workspace = true }
 http               = { workspace = true }
 itertools          = { workspace = true }
 parity-scale-codec = { workspace = true }
+sha2               = { workspace = true }
 serde              = { workspace = true, features = ["derive"] }
 subxt              = { workspace = true, features = ["reconnecting-rpc-client"] }
 thiserror          = { workspace = true }

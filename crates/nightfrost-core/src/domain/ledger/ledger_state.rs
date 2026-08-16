@@ -504,10 +504,9 @@ impl LedgerState {
                 ledger_state,
                 block_fullness,
             } => {
-                let transaction = tagged_deserialize::<TransactionV8<FjallLedgerDb>>(
-                    &mut transaction.as_ref(),
-                )
-                .map_err(|error| Error::Deserialize("LedgerTransactionV8", error))?;
+                let transaction =
+                    tagged_deserialize::<TransactionV8<FjallLedgerDb>>(&mut transaction.as_ref())
+                        .map_err(|error| Error::Deserialize("LedgerTransactionV8", error))?;
 
                 let cx = TransactionContextV8 {
                     ref_state: ledger_state.clone(),
@@ -589,10 +588,9 @@ impl LedgerState {
                 ledger_state,
                 block_fullness,
             } => {
-                let transaction = tagged_deserialize::<TransactionV9<FjallLedgerDb>>(
-                    &mut transaction.as_ref(),
-                )
-                .map_err(|error| Error::Deserialize("LedgerTransactionV9", error))?;
+                let transaction =
+                    tagged_deserialize::<TransactionV9<FjallLedgerDb>>(&mut transaction.as_ref())
+                        .map_err(|error| Error::Deserialize("LedgerTransactionV9", error))?;
 
                 let cx = TransactionContextV9 {
                     ref_state: ledger_state.clone(),

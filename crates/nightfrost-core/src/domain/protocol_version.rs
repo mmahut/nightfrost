@@ -13,6 +13,11 @@
 
 // Vendored and adapted from midnight-indexer (indexer-common/src/domain/protocol_version.rs).
 
+// Leading zeros below are a deliberate visual grouping of version numbers
+// (e.g. 0_022_000 reads as "0.022.000"), not accidental octal-looking
+// literals.
+#![allow(clippy::zero_prefixed_literal)]
+
 use std::num::TryFromIntError;
 
 use derive_more::Display;

@@ -19,6 +19,10 @@ pub type NodeTipHeight = std::sync::Arc<std::sync::RwLock<Option<u64>>>;
 /// All fjall partitions, opened once at startup.
 pub struct Store {
     pub keyspace: Keyspace,
+    /// Store schema: 1 = state inlined per action, 2 = content-addressed
+    /// contract_states + contract_actions_v2. Fresh stores start at
+    /// SCHEMA_CURRENT; absence on a non-empty store means 1.
+    pub schema: u64,
     pub meta: PartitionHandle,
     pub blocks: PartitionHandle,
     pub blocks_by_hash: PartitionHandle,
@@ -29,8 +33,15 @@ pub struct Store {
     pub utxos_unspent_by_owner: PartitionHandle,
     pub balances: PartitionHandle,
     pub addr_txs: PartitionHandle,
+    /// Active contract-action records: the "contract_actions_v2" partition on
+    /// a current-schema store, the legacy "contract_actions" partition on a
+    /// schema-1 store opened for migration.
     pub contract_actions: PartitionHandle,
     pub contract_actions_by_addr: PartitionHandle,
+    /// Content-addressed contract-state blobs (schema 2), key-value separated:
+    /// values are large and immutable, so they live in the blob log instead of
+    /// being rewritten by every LSM compaction.
+    pub contract_states: PartitionHandle,
     pub contracts: PartitionHandle,
     pub ledger_events: PartitionHandle,
     pub events_by_contract: PartitionHandle,
@@ -44,6 +55,8 @@ pub struct Store {
 
 pub mod meta_keys {
     pub const LAST_HEIGHT: &str = "last_indexed_height";
+    pub const SCHEMA_VERSION: &str = "schema_version";
+    pub const CONTRACT_STATES_BACKFILL_CURSOR: &str = "contract_states_backfill_cursor";
     pub const TIP_TIMESTAMP: &str = "tip_timestamp";
     pub const GENESIS_HASH: &str = "genesis_hash";
     pub const NEXT_TX_ID: &str = "next_tx_id";
@@ -124,6 +137,21 @@ pub struct UtxoRecord {
 pub struct ContractActionRecord {
     pub address: ByteVec,
     pub attributes: ContractAttributes,
+    /// Content hash keying the state blob in `contract_states`; None marks a
+    /// failed action (previously an empty state), which never becomes a
+    /// contract's latest pointer.
+    pub state_hash: Option<[u8; 32]>,
+    pub balances: Vec<ContractBalance>,
+    pub tx_id: u64,
+    pub block_height: u64,
+}
+
+/// Schema-1 shape of `ContractActionRecord`, which inlined the full state
+/// blob per action. Only the contract-states backfill decodes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyContractActionRecord {
+    pub address: ByteVec,
+    pub attributes: ContractAttributes,
     pub state: ByteVec,
     pub balances: Vec<ContractBalance>,
     pub tx_id: u64,
@@ -189,12 +217,60 @@ pub fn utxo_key(intent_hash: &[u8; 32], output_index: u32) -> [u8; 36] {
     key
 }
 
+/// Current store schema; see `Store::schema`.
+pub const SCHEMA_CURRENT: u64 = 2;
+
+/// Legacy name of the schema-1 inline-state partition, kept only so the
+/// migration can read it and reclamation can delete it.
+pub const LEGACY_CONTRACT_ACTIONS: &str = "contract_actions";
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> fjall::Result<Self> {
-        let keyspace = fjall::Config::new(path).open()?;
+        // fjall 2.x halts ALL writes once the journal directory exceeds this
+        // cap, expecting flushing to drain it. Its in-order journal eviction
+        // can livelock behind a rarely-written partition (observed in
+        // production during mainnet/preprod catch-up: journals piled up past
+        // the 512 MiB default with the flusher idle, permanently halting the
+        // pipeline). Raise the cap far above any realistic backlog; revisit
+        // when upgrading to fjall 3, which rewrote the stall bookkeeping.
+        let keyspace = fjall::Config::new(path)
+            .max_journaling_size(32 * 1024 * 1024 * 1024)
+            .open()?;
         let part = |name: &str| keyspace.open_partition(name, PartitionCreateOptions::default());
+
+        // Schema detection before anything decodes records: a fresh store is
+        // current by construction; a non-empty store without the version key
+        // predates it and is schema 1. Callers gate on require_current_schema
+        // so a legacy store is only ever decoded by the migration.
+        let meta = part("meta")?;
+        let stored_schema = meta
+            .get(meta_keys::SCHEMA_VERSION)?
+            .map(|v| u64::from_be_bytes(v.as_ref().try_into().expect("8-byte schema version")));
+        let is_empty = meta.get(meta_keys::LAST_HEIGHT)?.is_none();
+        let schema = match stored_schema {
+            Some(v) => v,
+            None if is_empty => {
+                meta.insert(meta_keys::SCHEMA_VERSION, SCHEMA_CURRENT.to_be_bytes())?;
+                SCHEMA_CURRENT
+            }
+            None => 1,
+        };
+        let contract_actions_name = if schema >= 2 {
+            "contract_actions_v2"
+        } else {
+            LEGACY_CONTRACT_ACTIONS
+        };
+        let contract_states = keyspace.open_partition(
+            "contract_states",
+            PartitionCreateOptions::default()
+                .with_kv_separation(fjall::KvSeparationOptions::default()),
+        )?;
+
         Ok(Self {
-            meta: part("meta")?,
+            schema,
+            contract_actions: part(contract_actions_name)?,
+            contract_states,
+            meta,
             blocks: part("blocks")?,
             blocks_by_hash: part("blocks_by_hash")?,
             txs: part("txs")?,
@@ -204,7 +280,6 @@ impl Store {
             utxos_unspent_by_owner: part("utxos_unspent_by_owner")?,
             balances: part("balances")?,
             addr_txs: part("addr_txs")?,
-            contract_actions: part("contract_actions")?,
             contract_actions_by_addr: part("contract_actions_by_addr")?,
             contracts: part("contracts")?,
             ledger_events: part("ledger_events")?,
@@ -220,6 +295,68 @@ impl Store {
 
     pub fn batch(&self) -> Batch {
         self.keyspace.batch()
+    }
+
+    /// Errors unless the store is on the current schema. Every entry point
+    /// that decodes records calls this; only the contract-states backfill
+    /// may operate on a legacy store.
+    pub fn require_current_schema(&self) -> Result<(), String> {
+        if self.schema == SCHEMA_CURRENT {
+            Ok(())
+        } else {
+            Err(format!(
+                "data directory is on store schema {} (current is {}); run \
+                 `nightfrost --backfill-contract-states` with the indexer stopped to migrate",
+                self.schema, SCHEMA_CURRENT,
+            ))
+        }
+    }
+
+    /// Every partition, for whole-store maintenance sweeps.
+    pub fn partitions(&self) -> [&PartitionHandle; 21] {
+        [
+            &self.meta,
+            &self.blocks,
+            &self.blocks_by_hash,
+            &self.txs,
+            &self.txs_by_hash,
+            &self.txs_by_identifier,
+            &self.utxos,
+            &self.utxos_unspent_by_owner,
+            &self.balances,
+            &self.addr_txs,
+            &self.contract_actions,
+            &self.contract_actions_by_addr,
+            &self.contract_states,
+            &self.contracts,
+            &self.ledger_events,
+            &self.events_by_contract,
+            &self.dust_generation,
+            &self.dust_gen_by_owner,
+            &self.cnight_registrations,
+            &self.ledger_db_nodes,
+            &self.ledger_db_roots,
+        ]
+    }
+
+    /// Unsticks fjall's flushing when a journal backlog exists. fjall's
+    /// flusher only wakes when a memtable is sealed, and sealing normally
+    /// happens on the write path; after recovering a large journal backlog
+    /// with writes halted (buffer saturation or journal cap), nothing ever
+    /// seals, so the halt never lifts (observed livelocking production
+    /// mainnet and preprod). Rotating every partition seals whatever is
+    /// stagnant, wakes the flusher, and lets sealed journals evict; each
+    /// rotation is a no-op for empty memtables.
+    pub fn unstick_flushing(&self) -> fjall::Result<()> {
+        for partition in self.partitions() {
+            partition.rotate_memtable()?;
+        }
+        Ok(())
+    }
+
+    /// Journal files currently retained by the keyspace.
+    pub fn journal_count(&self) -> usize {
+        self.keyspace.journal_count()
     }
 
     fn meta_u64(&self, key: &str) -> fjall::Result<Option<u64>> {
@@ -268,6 +405,15 @@ impl Store {
     pub fn tx_ids_by_hash(&self, hash: &[u8; 32]) -> fjall::Result<Vec<u64>> {
         self.txs_by_hash
             .prefix(hash)
+            .map(|entry| entry.map(|(key, _)| key_u64_suffix(&key)))
+            .collect()
+    }
+
+    /// Transaction ids containing an identifier (identifiers are not unique
+    /// across chain history).
+    pub fn tx_ids_by_identifier(&self, identifier: &[u8]) -> fjall::Result<Vec<u64>> {
+        self.txs_by_identifier
+            .prefix(identifier)
             .map(|entry| entry.map(|(key, _)| key_u64_suffix(&key)))
             .collect()
     }

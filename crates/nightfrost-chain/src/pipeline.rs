@@ -11,12 +11,14 @@ use crate::{
 use anyhow::{Context, bail};
 use async_stream::stream;
 use futures::{Stream, StreamExt, TryStreamExt, future::ok};
+use sha2::{Digest, Sha256};
+
 use nightfrost_core::{
     domain::{
         LedgerEventAttributes, LedgerVersion, NetworkId, TransactionResult, TransactionVariant,
         UnshieldedUtxo,
         dust::DustRegistrationEvent,
-        ledger::{ContractState, LedgerState},
+        ledger::{ContractState, Error as LedgerError, LedgerState},
     },
     store::{
         self, BlockRecord, CnightRegistrationRecord, ContractActionRecord, ContractRecord,
@@ -24,7 +26,13 @@ use nightfrost_core::{
         prefixed_u64_key, utxo_key,
     },
 };
-use std::{collections::HashMap, future::ready, pin::pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::ready,
+    pin::pin,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
 use tokio::{task, time::sleep};
 
 /// Amount, in milliseconds, by which the first regular transaction's dust-validity
@@ -38,8 +46,25 @@ const MEMPOOL_TBLOCK_BUMP_MILLIS: u64 = 2 * 6_000;
 const BLOCKS_BUFFER: usize = 32;
 const CAUGHT_UP_MAX_DISTANCE: u64 = 10;
 const GC_BOUND: Duration = Duration::from_millis(200);
+/// During catch-up the gc sweep runs every this many blocks instead of every
+/// block; see the comment at the call site.
+const CATCH_UP_GC_INTERVAL: u64 = 16;
 const LEDGER_STATE_RETENTION: usize = 32;
 const PROGRESS_LOG_INTERVAL: u64 = 1_000;
+
+/// If no block has been successfully indexed for this long, the pipeline is
+/// considered stalled and the process exits for systemd to restart it. Real
+/// per-block work (including catch-up chunk fetches) always completes in
+/// well under a minute even under heavy contention; this only fires on a
+/// genuine stall. One real cause seen in production: fjall's write-halt
+/// backoff (a plain blocking sleep loop waiting for background compaction
+/// to free up journal space) can spin forever if compaction never catches
+/// up, silently wedging the whole indexing task with no further logging
+/// (the same task also owns the node-stream recovery/resubscribe logic, so
+/// a stuck write blocks that too, indefinitely). A restart consistently
+/// clears it.
+const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const STALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub async fn run(
     store: Arc<Store>,
@@ -49,7 +74,11 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     // A reused data directory must belong to this chain; anything else would
     // fail later with a confusing parent-hash mismatch loop.
-    if let Some(stored) = store.meta.get(meta_keys::GENESIS_HASH).context("read genesis hash")? {
+    if let Some(stored) = store
+        .meta
+        .get(meta_keys::GENESIS_HASH)
+        .context("read genesis hash")?
+    {
         let node_genesis = node.genesis_hash();
         if stored.as_ref() != node_genesis {
             bail!(
@@ -110,6 +139,10 @@ pub async fn run(
             .context("create ledger state")?,
     };
 
+    // Last time a block was successfully indexed; watched below to detect a
+    // stalled pipeline.
+    let last_progress = Arc::new(RwLock::new(Instant::now()));
+
     // Watch the node's finalized tip for caught-up/sync-status reporting.
     let watcher_node = node.clone();
     let watcher_highest = highest_block_on_node.clone();
@@ -128,18 +161,55 @@ pub async fn run(
         Ok::<_, anyhow::Error>(())
     });
 
+    let watchdog_progress = last_progress.clone();
+    let watchdog_task = task::spawn(async move {
+        loop {
+            sleep(WATCHDOG_CHECK_INTERVAL).await;
+            let elapsed = watchdog_progress
+                .read()
+                .expect("lock last progress")
+                .elapsed();
+            if elapsed > STALL_TIMEOUT {
+                // A normal `return Err(..)` here would go through the async
+                // runtime's ordinary error propagation and shutdown, which
+                // waits for every outstanding blocking-pool thread to finish
+                // naturally before the process can exit — including the one
+                // permanently wedged in index_block's task::block_in_place
+                // call, which is the exact failure this watchdog exists to
+                // route around. That combination doesn't hang indexing
+                // anymore, it hangs in shutdown instead: same symptom
+                // (unreachable, never recovers), confirmed live by a stack
+                // sample showing the main thread parked in
+                // BlockingPool::shutdown. Only an immediate, unconditional
+                // process exit, bypassing graceful async teardown entirely,
+                // actually terminates the process here.
+                tracing::error!(
+                    ?elapsed,
+                    ?STALL_TIMEOUT,
+                    "indexing pipeline stalled; exiting immediately so systemd restarts it"
+                );
+                std::process::exit(1);
+            }
+        }
+    });
+
     let mut index_task = task::spawn(async move {
         let mut ids = Counters::load(&store)?;
         let genesis_node = node.clone();
-        let blocks = node_blocks(resume_from, node).map(ready).buffered(BLOCKS_BUFFER);
+        let blocks = node_blocks(resume_from, node)
+            .map(ready)
+            .buffered(BLOCKS_BUFFER);
         let mut blocks = pin!(blocks);
 
+        let mut stages = StageTimes::default();
         loop {
+            let stage_start = Instant::now();
             let block = blocks
                 .try_next()
                 .await
                 .context("get next block from node")?
                 .context("finalized block stream ended")?;
+            stages.fetch += stage_start.elapsed();
 
             // The genesis ledger state comes from the node's system properties.
             let genesis_ledger_state = if block.height == 0 {
@@ -165,14 +235,17 @@ pub async fn run(
                     &mut parent_block_timestamp,
                     &window,
                     &mut ids,
+                    &mut stages,
                 )
             })
             .with_context(|| format!("index block {hash} at height {height}"))?;
             ledger_state = next_state;
+            *last_progress.write().expect("lock last progress") = Instant::now();
 
             // Unpersist keys that aged out of the retention window (the window
             // stored in meta was already updated in the block's batch), then run
             // a time-bounded gc pass.
+            let stage_start = Instant::now();
             window
                 .0
                 .push((new_key, ledger_state.ledger_version().into()));
@@ -181,24 +254,52 @@ pub async fn run(
                 LedgerState::unpersist(&key, LedgerVersion::from(version))
                     .context("unpersist ledger state beyond retention window")?;
             }
-            LedgerState::gc(GC_BOUND);
 
             let node_height = *highest_block_on_node.read().expect("lock highest block");
             let distance = node_height.map(|h| h.saturating_sub(height));
             let caught_up = distance.is_some_and(|d| d <= CAUGHT_UP_MAX_DISTANCE);
+
+            // The arena gc sweep dominated catch-up in production (460-550ms
+            // per block against replay's ~2ms, measured via the stage times
+            // below), so during catch-up it runs amortized every Nth block.
+            // Garbage accumulates on disk between sweeps but each sweep still
+            // collects it; at the tip the per-block cadence keeps the arena
+            // tight.
+            if caught_up || height.is_multiple_of(CATCH_UP_GC_INTERVAL) {
+                LedgerState::gc(GC_BOUND);
+            }
+            stages.gc += stage_start.elapsed();
+            stages.blocks += 1;
             if caught_up || height % PROGRESS_LOG_INTERVAL == 0 {
                 tracing::info!(height, ?distance, caught_up, "block indexed");
+            }
+            if height % PROGRESS_LOG_INTERVAL == 0 && stages.blocks > 0 {
+                tracing::info!(
+                    blocks = stages.blocks,
+                    fetch_ms = stages.fetch.as_millis() as u64,
+                    replay_ms = stages.replay.as_millis() as u64,
+                    roots_ms = stages.roots.as_millis() as u64,
+                    persist_ms = stages.persist.as_millis() as u64,
+                    write_ms = stages.write.as_millis() as u64,
+                    gc_ms = stages.gc.as_millis() as u64,
+                    "pipeline stage times"
+                );
+                stages = StageTimes::default();
             }
         }
     });
 
+    // watchdog_task never completes through normal means (see above); it
+    // only needs aborting here so it doesn't outlive a normal shutdown.
     tokio::select! {
         result = &mut highest_task => {
             index_task.abort();
+            watchdog_task.abort();
             result.context("highest-block task panicked")?
         }
         result = &mut index_task => {
             highest_task.abort();
+            watchdog_task.abort();
             result.context("index task panicked")?
         }
     }
@@ -222,6 +323,20 @@ impl Counters {
     }
 }
 
+/// Wall time accumulated per pipeline stage, logged and reset every
+/// PROGRESS_LOG_INTERVAL blocks so catch-up bottlenecks show up in the logs
+/// (docs/ROADMAP.md 2a).
+#[derive(Default)]
+struct StageTimes {
+    fetch: Duration,
+    replay: Duration,
+    roots: Duration,
+    persist: Duration,
+    write: Duration,
+    gc: Duration,
+    blocks: u64,
+}
+
 /// An infinite stream of node blocks without duplicates, gaps or unexpected
 /// parents; re-subscribes when the node misbehaves.
 fn node_blocks(
@@ -234,21 +349,18 @@ fn node_blocks(
             let mut blocks = pin!(blocks);
 
             while let Some(block) = blocks.next().await {
-                match &block {
-                    Ok(block) => {
-                        let expected = highest_block.map(|b| b.hash).unwrap_or_default();
-                        if block.parent_hash != expected {
-                            tracing::warn!(
-                                height = block.height,
-                                parent_hash = %block.parent_hash,
-                                expected = %expected,
-                                "unexpected block, re-subscribing"
-                            );
-                            break;
-                        }
-                        highest_block = Some(BlockRef::from(block));
+                if let Ok(block) = &block {
+                    let expected = highest_block.map(|b| b.hash).unwrap_or_default();
+                    if block.parent_hash != expected {
+                        tracing::warn!(
+                            height = block.height,
+                            parent_hash = %block.parent_hash,
+                            expected = %expected,
+                            "unexpected block, re-subscribing"
+                        );
+                        break;
                     }
-                    Err(_) => {}
+                    highest_block = Some(BlockRef::from(block));
                 }
 
                 yield block.map_err(Into::into);
@@ -262,6 +374,7 @@ fn node_blocks(
 /// Replay one block: apply all transactions to the ledger state, verify the
 /// recomputed roots against the node's, persist the arena, and commit all
 /// derived entities in one atomic batch.
+#[allow(clippy::too_many_arguments)]
 fn index_block(
     store: &Store,
     block: Block,
@@ -271,7 +384,11 @@ fn index_block(
     parent_block_timestamp: &mut u64,
     window: &LedgerStateWindow,
     ids: &mut Counters,
-) -> anyhow::Result<(LedgerState, nightfrost_core::domain::SerializedLedgerStateKey)> {
+    stages: &mut StageTimes,
+) -> anyhow::Result<(
+    LedgerState,
+    nightfrost_core::domain::SerializedLedgerStateKey,
+)> {
     let ledger_version = block.protocol_version.ledger_version();
 
     ledger_state = if block.height == 0 {
@@ -316,15 +433,17 @@ fn index_block(
     };
 
     // Apply all transactions, deriving one TxRecord (+ children) per transaction.
+    let stage_start = Instant::now();
     let mut derived = Vec::with_capacity(block.transactions.len());
     let mut first_regular = true;
     for transaction in &block.transactions {
+        let bump_tblock = block.height > 0 && first_regular;
         let applied = apply_transaction(
             &mut ledger_state,
             transaction,
             &block,
             *parent_block_timestamp,
-            block.height > 0 && first_regular,
+            bump_tblock,
         )?;
         if matches!(transaction, Transaction::Regular(_)) {
             first_regular = false;
@@ -334,6 +453,7 @@ fn index_block(
     ledger_state
         .finalize_apply_transactions(block.timestamp)
         .context("finalize transaction application")?;
+    stages.replay += stage_start.elapsed();
 
     // Post-block-0 genesis: the fresh state was only used to derive transaction
     // outcomes; the chain continues from the genesis state.
@@ -345,6 +465,7 @@ fn index_block(
 
     // The root-match guard: with proof verification off this is the proof that
     // the replay matches the node bit-for-bit. Halt on mismatch.
+    let stage_start = Instant::now();
     let ledger_state_root = ledger_state.root().context("ledger state root")?;
     if block
         .ledger_state_root
@@ -364,15 +485,20 @@ fn index_block(
             block.height
         );
     }
+    stages.roots += stage_start.elapsed();
 
     // Persist the arena BEFORE the entity batch: on a crash in between, the arena
     // is at most one block ahead and the orphan root is bounded (mirrors the
     // official indexer's recovery model).
+    let stage_start = Instant::now();
     let (ledger_state, ledger_state_key) =
         ledger_state.persist().context("persist ledger state")?;
+    stages.persist += stage_start.elapsed();
 
+    let stage_start = Instant::now();
     write_block(store, &block, derived, &ledger_state_key, window, ids)
         .context("write block batch")?;
+    stages.write += stage_start.elapsed();
 
     Ok((ledger_state, ledger_state_key))
 }
@@ -384,7 +510,13 @@ struct AppliedTransaction {
     result: TransactionResult,
     fees: u128,
     identifiers: Vec<nightfrost_core::domain::SerializedTransactionIdentifier>,
-    contract_actions: Vec<(nightfrost_core::domain::ByteVec, ContractActionRecord)>,
+    /// (address, record, state blob) — the blob rides along so write_block
+    /// can insert it into contract_states keyed by the record's state_hash.
+    contract_actions: Vec<(
+        nightfrost_core::domain::ByteVec,
+        ContractActionRecord,
+        nightfrost_core::domain::ByteVec,
+    )>,
     created_utxos: Vec<UnshieldedUtxo>,
     spent_utxos: Vec<UnshieldedUtxo>,
     ledger_events: Vec<nightfrost_core::domain::LedgerEvent>,
@@ -408,15 +540,42 @@ fn apply_transaction(
                 block.timestamp
             };
 
-            let outcome = ledger_state
-                .apply_regular_transaction(
-                    &tx.raw,
-                    block.parent_hash,
-                    block.timestamp,
-                    parent_block_timestamp,
-                    well_formed_timestamp,
-                )
-                .with_context(|| format!("apply regular transaction {}", tx.hash))?;
+            let outcome = match ledger_state.apply_regular_transaction(
+                &tx.raw,
+                block.parent_hash,
+                block.timestamp,
+                parent_block_timestamp,
+                well_formed_timestamp,
+            ) {
+                Ok(outcome) => outcome,
+                // The bump above is itself a workaround for a node bug
+                // (midnightntwrk/midnight-node#1924): the node's own tblock
+                // handling was inconsistent for some already-mined blocks,
+                // so a single fixed +2-slots correction helps the common
+                // case but overshoots others, where the real fix would need
+                // to go the other way. Confirmed live on preprod at height
+                // 164460: a transaction whose declared TTL is 2s short of
+                // the bumped timestamp, but comfortably valid (4s to spare)
+                // against the real, unbumped block time. well_formed()
+                // hasn't mutated ledger_state when it fails (the mutating
+                // apply() call is never reached), so retrying is free of
+                // side effects; if the plain timestamp also fails, the
+                // original bumped-timestamp error is almost certainly the
+                // more informative one to report.
+                Err(LedgerError::MalformedTransaction(_)) if bump_tblock => ledger_state
+                    .apply_regular_transaction(
+                        &tx.raw,
+                        block.parent_hash,
+                        block.timestamp,
+                        parent_block_timestamp,
+                        block.timestamp,
+                    )
+                    .with_context(|| format!("apply regular transaction {}", tx.hash))?,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("apply regular transaction {}", tx.hash));
+                }
+            };
 
             let ledger_version = tx.protocol_version.ledger_version();
             let contract_actions = tx
@@ -453,15 +612,20 @@ fn apply_transaction(
                             }
                         }
                     };
+                    let state_hash = if action.state.is_empty() {
+                        None
+                    } else {
+                        Some(Sha256::digest(action.state.as_ref()).into())
+                    };
                     let record = ContractActionRecord {
                         address: action.address.clone(),
                         attributes: action.attributes.clone(),
-                        state: action.state.clone(),
+                        state_hash,
                         balances,
-                        tx_id: 0,        // assigned in write_block
+                        tx_id: 0, // assigned in write_block
                         block_height: block.height,
                     };
-                    Ok((action.address.clone(), record))
+                    Ok((action.address.clone(), record, action.state.clone()))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -519,6 +683,8 @@ fn write_block(
     let mut balance_deltas: HashMap<([u8; 32], [u8; 32]), i128> = HashMap::new();
     let mut touched_addresses: HashMap<[u8; 32], Vec<u64>> = HashMap::new();
     let mut contracts_this_block: HashMap<Vec<u8>, ContractRecord> = HashMap::new();
+    let mut states_this_block: std::collections::HashSet<[u8; 32]> =
+        std::collections::HashSet::new();
 
     for (index, applied) in transactions.iter().enumerate() {
         let tx_id = ids.next_tx_id;
@@ -548,16 +714,15 @@ fn write_block(
                 spending_tx_id: None,
             };
             batch.insert(&store.utxos, key, store::encode(&record));
-            batch.insert(
-                &store.utxos_unspent_by_owner,
-                unspent_key(utxo),
-                key,
-            );
+            batch.insert(&store.utxos_unspent_by_owner, unspent_key(utxo), key);
             created_this_block.insert(key, record);
             *balance_deltas
                 .entry((utxo.owner.0, utxo.token_type.0))
                 .or_default() += utxo.value as i128;
-            touched_addresses.entry(utxo.owner.0).or_default().push(tx_id);
+            touched_addresses
+                .entry(utxo.owner.0)
+                .or_default()
+                .push(tx_id);
         }
 
         // Spent UTXOs: mark spent and drop from the unspent index.
@@ -570,7 +735,10 @@ fn write_block(
                     .get(key)?
                     .map(|v| store::decode(&v))
                     .with_context(|| {
-                        format!("spent utxo {}/{} not found", utxo.intent_hash, utxo.output_index)
+                        format!(
+                            "spent utxo {}/{} not found",
+                            utxo.intent_hash, utxo.output_index
+                        )
                     })?,
             };
             record.spending_tx_id = Some(tx_id);
@@ -580,12 +748,15 @@ fn write_block(
             *balance_deltas
                 .entry((utxo.owner.0, utxo.token_type.0))
                 .or_default() -= utxo.value as i128;
-            touched_addresses.entry(utxo.owner.0).or_default().push(tx_id);
+            touched_addresses
+                .entry(utxo.owner.0)
+                .or_default()
+                .push(tx_id);
         }
 
         // Contract actions.
         let mut contract_action_ids = Vec::with_capacity(applied.contract_actions.len());
-        for (address, record) in &applied.contract_actions {
+        for (address, record, state) in &applied.contract_actions {
             let action_id = ids.next_action_id;
             ids.next_action_id += 1;
             contract_action_ids.push(action_id);
@@ -603,10 +774,24 @@ fn write_block(
                 [],
             );
 
-            // Failed actions (empty state) stay indexed for parity with the
+            // Insert the state blob only if this exact content is new. With
+            // key-value separation a redundant insert is not collapsed by
+            // compaction: it sits in the blob log until a manual GC, so the
+            // skip is a correctness requirement, not an optimization. The
+            // in-block set covers duplicates within this batch, which
+            // contains_key cannot see (fjall batches are write-only).
+            if let Some(hash) = record.state_hash
+                && !states_this_block.contains(&hash)
+                && !store.contract_states.contains_key(hash)?
+            {
+                batch.insert(&store.contract_states, hash, state.as_ref());
+                states_this_block.insert(hash);
+            }
+
+            // Failed actions (no state) stay indexed for parity with the
             // official indexer, but never become a contract's deploy/latest
             // pointer — /contracts/{addr}/state must not serve an empty state.
-            if record.state.is_empty() {
+            if record.state_hash.is_none() {
                 continue;
             }
 
@@ -646,7 +831,7 @@ fn write_block(
                     .contract_actions
                     .iter()
                     .zip(&contract_action_ids)
-                    .map(|((address, record), &action_id)| {
+                    .map(|((address, record, _), &action_id)| {
                         (action_id, address, &record.attributes)
                     }),
             )
@@ -682,8 +867,12 @@ fn write_block(
                 // night_utxo_hash is stable across the create/update pair
                 // (confirmed byte-identical), matching the official
                 // chain-indexer's own `UPDATE ... WHERE night_utxo_hash = ?`.
-                LedgerEventAttributes::DustInitialUtxo { generation_info, .. }
-                | LedgerEventAttributes::DustGenerationDtimeUpdate { generation_info, .. } => {
+                LedgerEventAttributes::DustInitialUtxo {
+                    generation_info, ..
+                }
+                | LedgerEventAttributes::DustGenerationDtimeUpdate {
+                    generation_info, ..
+                } => {
                     let record = DustGenerationRecord {
                         info: generation_info.clone(),
                         tx_id,
@@ -695,7 +884,10 @@ fn write_block(
                     );
                     batch.insert(
                         &store.dust_gen_by_owner,
-                        dust_gen_owner_key(&generation_info.owner, &generation_info.night_utxo_hash.0),
+                        dust_gen_owner_key(
+                            &generation_info.owner,
+                            &generation_info.night_utxo_hash.0,
+                        ),
                         [],
                     );
                 }
@@ -774,7 +966,7 @@ fn write_block(
     let mut next_window = LedgerStateWindow(window.0.clone());
     next_window.0.push((
         ledger_state_key.clone(),
-        LedgerVersion::from(block.protocol_version.ledger_version()).into(),
+        block.protocol_version.ledger_version().into(),
     ));
     while next_window.0.len() > LEDGER_STATE_RETENTION {
         next_window.0.remove(0);
@@ -815,7 +1007,10 @@ fn write_block(
 
 /// dust_gen_by_owner secondary key: owner (variable-length DustPublicKey)
 /// followed by the fixed 32-byte night_utxo_hash primary key.
-fn dust_gen_owner_key(owner: &nightfrost_core::domain::DustPublicKey, night_utxo_hash: &[u8; 32]) -> Vec<u8> {
+fn dust_gen_owner_key(
+    owner: &nightfrost_core::domain::DustPublicKey,
+    night_utxo_hash: &[u8; 32],
+) -> Vec<u8> {
     let mut key = Vec::with_capacity(owner.0.len() + 32);
     key.extend_from_slice(&owner.0);
     key.extend_from_slice(night_utxo_hash);
@@ -886,7 +1081,9 @@ fn apply_registration_event(
             record.removed_at_height = Some(block_height);
         }
         DustRegistrationEvent::MappingAdded {
-            utxo_id, utxo_index, ..
+            utxo_id,
+            utxo_index,
+            ..
         } => {
             // A live NIGHT-utxo mapping IS a valid registration; the common
             // path emits MappingAdded without a separate Registration event.

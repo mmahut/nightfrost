@@ -18,12 +18,12 @@ use crate::subxt_node::{
     runtimes::{BlockDetails, Transaction},
 };
 use futures::TryStreamExt;
+use itertools::Itertools;
 use nightfrost_core::domain::{
     ByteVec, DustPublicKey, SerializedContractAddress, SerializedContractState,
     bridge::{BridgeEvent, BridgeRecipient},
     dust::DustRegistrationEvent,
 };
-use itertools::Itertools;
 use parity_scale_codec::Decode;
 use subxt::error::RuntimeApiError;
 

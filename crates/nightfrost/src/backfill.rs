@@ -54,7 +54,7 @@ pub fn backfill_contract_events(store: &Store) -> anyhow::Result<BackfillCounts>
         pending += 1;
 
         let tx_id = record.tx_id;
-        if !actions_cache.contains_key(&tx_id) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = actions_cache.entry(tx_id) {
             let tx = store
                 .tx(tx_id)?
                 .with_context(|| format!("missing tx record {tx_id} for event {event_id}"))?;
@@ -70,7 +70,7 @@ pub fn backfill_contract_events(store: &Store) -> anyhow::Result<BackfillCounts>
                     Ok((action_id, action))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            actions_cache.insert(tx_id, actions);
+            entry.insert(actions);
             if actions_cache.len() > 10_000 {
                 actions_cache.clear();
             }
@@ -146,8 +146,12 @@ pub fn backfill_dust_generation(store: &Store) -> anyhow::Result<DustBackfillCou
         counts.events_scanned += 1;
 
         let generation_info = match &record.event.attributes {
-            LedgerEventAttributes::DustInitialUtxo { generation_info, .. } => generation_info,
-            LedgerEventAttributes::DustGenerationDtimeUpdate { generation_info, .. } => generation_info,
+            LedgerEventAttributes::DustInitialUtxo {
+                generation_info, ..
+            } => generation_info,
+            LedgerEventAttributes::DustGenerationDtimeUpdate {
+                generation_info, ..
+            } => generation_info,
             _ => continue,
         };
 
@@ -155,7 +159,10 @@ pub fn backfill_dust_generation(store: &Store) -> anyhow::Result<DustBackfillCou
             info: generation_info.clone(),
             tx_id: record.tx_id,
         };
-        new_generation.push((generation_info.night_utxo_hash.0, store::encode(&gen_record)));
+        new_generation.push((
+            generation_info.night_utxo_hash.0,
+            store::encode(&gen_record),
+        ));
         let mut owner_key = generation_info.owner.0.clone();
         owner_key.extend_from_slice(&generation_info.night_utxo_hash.0);
         new_owner.push(owner_key);
@@ -173,10 +180,11 @@ pub fn backfill_dust_generation(store: &Store) -> anyhow::Result<DustBackfillCou
     // genuine garbage — keys absent from the fresh rebuild — makes the
     // remove-set and insert-set disjoint, so no key's fate depends on
     // interleaving order.
-    let new_generation_keys: std::collections::HashSet<Vec<u8>> =
-        new_generation.iter().map(|(hash, _)| hash.to_vec()).collect();
-    let new_owner_keys: std::collections::HashSet<Vec<u8>> =
-        new_owner.iter().cloned().collect();
+    let new_generation_keys: std::collections::HashSet<Vec<u8>> = new_generation
+        .iter()
+        .map(|(hash, _)| hash.to_vec())
+        .collect();
+    let new_owner_keys: std::collections::HashSet<Vec<u8>> = new_owner.iter().cloned().collect();
 
     let old_generation_keys = store
         .dust_generation
@@ -260,4 +268,155 @@ pub struct DustBackfillCounts {
     pub rebuilt: bool,
     pub events_scanned: u64,
     pub generation_entries_written: u64,
+}
+
+/// Migrates a schema-1 store to schema 2: rewrites every inline-state
+/// contract-action record into `contract_actions_v2` with a content hash,
+/// stores each distinct state blob once in `contract_states`, flips the
+/// schema version only after everything is persisted, then reclaims the
+/// legacy partition as a separately retryable phase (docs/CONTRACT_STATE.md).
+/// Resumable: progress is cursored in meta, and a rerun after cutover goes
+/// straight to reclamation.
+pub fn backfill_contract_states(store: &Store) -> anyhow::Result<ContractStatesCounts> {
+    use nightfrost_core::store::{LEGACY_CONTRACT_ACTIONS, LegacyContractActionRecord, meta_keys};
+    use sha2::{Digest, Sha256};
+
+    let mut counts = ContractStatesCounts::default();
+
+    if store.schema >= nightfrost_core::store::SCHEMA_CURRENT {
+        // Post-cutover: only reclamation may remain.
+        if store.keyspace.partition_exists(LEGACY_CONTRACT_ACTIONS) {
+            let legacy = store
+                .keyspace
+                .open_partition(LEGACY_CONTRACT_ACTIONS, Default::default())
+                .context("open legacy partition for reclamation")?;
+            store
+                .keyspace
+                .delete_partition(legacy)
+                .context("delete legacy contract_actions partition")?;
+            counts.reclaimed = true;
+            tracing::info!("legacy contract_actions partition reclaimed");
+        }
+        return Ok(counts);
+    }
+
+    // The store is schema 1, so store.contract_actions IS the legacy
+    // partition; the v2 partition is opened explicitly here.
+    let v2 = store
+        .keyspace
+        .open_partition("contract_actions_v2", Default::default())
+        .context("open contract_actions_v2")?;
+
+    let resume_after = store
+        .meta
+        .get(meta_keys::CONTRACT_STATES_BACKFILL_CURSOR)
+        .context("read backfill cursor")?
+        .map(|v| u64::from_be_bytes(v.as_ref().try_into().expect("8-byte cursor")));
+    if let Some(cursor) = resume_after {
+        tracing::info!(cursor, "resuming contract-states backfill");
+    }
+
+    let mut batch = store.batch();
+    let mut pending = 0usize;
+    let mut last_id;
+    // Hashes inserted in the current uncommitted batch: contains_key cannot
+    // see pending writes, and contract_states is key-value separated, so a
+    // duplicate insert within one batch would stick in the blob log.
+    let mut pending_hashes: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+
+    for entry in store.contract_actions.iter() {
+        let (key, value) = entry.context("scan legacy contract_actions")?;
+        let action_id = u64::from_be_bytes(key.as_ref().try_into().context("8-byte action id")?);
+        if resume_after.is_some_and(|cursor| action_id <= cursor) {
+            continue;
+        }
+        let legacy: LegacyContractActionRecord = store::decode(&value);
+        counts.actions += 1;
+        last_id = action_id;
+
+        let state_hash = if legacy.state.is_empty() {
+            None
+        } else {
+            let hash: [u8; 32] = Sha256::digest(legacy.state.as_ref()).into();
+            // contains_key cannot see this batch's pending writes, so commit
+            // granularity below keeps correctness: a blob written in this
+            // batch is only skipped via the committed store after the commit,
+            // and duplicate inserts within one batch are collapsed by fjall
+            // for plain (non-separated) partitions -- but contract_states is
+            // separated, so check the batch-local set as well.
+            if !store
+                .contract_states
+                .contains_key(hash)
+                .context("check contract state")?
+                && pending_hashes.insert(hash)
+            {
+                batch.insert(&store.contract_states, hash, legacy.state.as_ref());
+                counts.blobs += 1;
+                counts.blob_bytes += legacy.state.len() as u64;
+            }
+            Some(hash)
+        };
+
+        let record = store::ContractActionRecord {
+            address: legacy.address,
+            attributes: legacy.attributes,
+            state_hash,
+            balances: legacy.balances,
+            tx_id: legacy.tx_id,
+            block_height: legacy.block_height,
+        };
+        batch.insert(&v2, key.as_ref(), store::encode(&record));
+        pending += 1;
+
+        if pending >= COMMIT_EVERY {
+            batch.insert(
+                &store.meta,
+                meta_keys::CONTRACT_STATES_BACKFILL_CURSOR,
+                last_id.to_be_bytes(),
+            );
+            batch.commit().context("commit migration batch")?;
+            pending_hashes.clear();
+            batch = store.batch();
+            pending = 0;
+            if counts.actions.is_multiple_of(100_000) {
+                tracing::info!(
+                    actions = counts.actions,
+                    blobs = counts.blobs,
+                    "migrating contract actions"
+                );
+            }
+        }
+    }
+
+    // Final batch: remaining records, cursor removal, and the cutover itself.
+    batch.remove(&store.meta, meta_keys::CONTRACT_STATES_BACKFILL_CURSOR);
+    batch.insert(
+        &store.meta,
+        meta_keys::SCHEMA_VERSION,
+        nightfrost_core::store::SCHEMA_CURRENT.to_be_bytes(),
+    );
+    batch.commit().context("commit migration cutover")?;
+    store
+        .keyspace
+        .persist(fjall::PersistMode::SyncAll)
+        .context("persist cutover")?;
+    counts.cut_over = true;
+    tracing::info!("schema cutover persisted; reclaiming legacy partition");
+
+    store
+        .keyspace
+        .delete_partition(store.contract_actions.clone())
+        .context("delete legacy contract_actions partition")?;
+    counts.reclaimed = true;
+
+    Ok(counts)
+}
+
+#[derive(Debug, Default)]
+pub struct ContractStatesCounts {
+    pub actions: u64,
+    pub blobs: u64,
+    pub blob_bytes: u64,
+    pub cut_over: bool,
+    pub reclaimed: bool,
 }

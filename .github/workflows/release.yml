@@ -1,0 +1,188 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        name: Require tag and package versions to match
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nightfrost") | .version')
+          explorer_version=$(jq -r .version examples/explorer/package.json)
+          wallet_version=$(jq -r .version examples/light-wallet/package.json)
+
+          for package_version in "$cargo_version" "$explorer_version" "$wallet_version"; do
+            if [[ "$package_version" != "$version" ]]; then
+              echo "Tag $GITHUB_REF_NAME does not match package version $package_version" >&2
+              exit 1
+            fi
+          done
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    name: Binary (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux native build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake nasm perl
+
+      - name: Install macOS native build dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake nasm
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --bin nightfrost --target ${{ matrix.target }}
+
+      - name: Package binary
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive="nightfrost-${VERSION}-${TARGET}"
+          mkdir -p "package/${archive}"
+          cp "target/${TARGET}/release/nightfrost" "package/${archive}/"
+          cp README.md LICENSE "package/${archive}/"
+          tar -czf "${archive}.tar.gz" -C package "$archive"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightfrost-${{ matrix.target }}
+          path: nightfrost-${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  frontends:
+    name: Frontend (${{ matrix.project }})
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        project:
+          - explorer
+          - light-wallet
+    defaults:
+      run:
+        working-directory: examples/${{ matrix.project }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: examples/${{ matrix.project }}/package-lock.json
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Package static bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          PROJECT: ${{ matrix.project }}
+        run: |
+          set -euo pipefail
+          archive="nightfrost-${PROJECT}-${VERSION}"
+          mkdir -p "package/${archive}"
+          cp -R dist "package/${archive}/"
+          cp README.md "package/${archive}/"
+          cp ../../LICENSE "package/${archive}/"
+          tar -czf "${GITHUB_WORKSPACE}/${archive}.tar.gz" -C package "$archive"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightfrost-${{ matrix.project }}
+          path: ${{ github.workspace }}/nightfrost-${{ matrix.project }}-${{ needs.validate.outputs.version }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - validate
+      - binaries
+      - frontends
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: release-assets
+        run: sha256sum *.tar.gz | sort -k2 > SHA256SUMS
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+            exit 0
+          fi
+
+          args=(
+            --verify-tag
+            --generate-notes
+            --title "Nightfrost $GITHUB_REF_NAME"
+          )
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create \
+            "$GITHUB_REF_NAME" \
+            release-assets/* \
+            "${args[@]}"

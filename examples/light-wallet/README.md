@@ -1,0 +1,98 @@
+# Nightfrost Midnight light wallet
+
+A small, testnet-only BIP39 wallet example for Midnight. It runs the official
+Midnight wallet SDK in the browser, replaces the SDK's GraphQL wallet-indexer
+services with a repository-local Nightfrost REST adapter, and can submit an
+unshielded NIGHT transfer.
+
+The SDK integration lives in
+[`src/nightfrost-sdk.ts`](./src/nightfrost-sdk.ts). It is part of this example,
+not a published fork or a separate SDK repository.
+
+## Run it
+
+```sh
+cd examples/light-wallet
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`. The default network picker expects:
+
+- Preview at `https://preview.nightfrost.dev`
+- Preprod at `http://127.0.0.1:3101`
+
+Override those URLs while retaining the fixed network definitions:
+
+```sh
+VITE_NETWORKS='[{"name":"Preview","apiUrl":"https://preview.example"},{"name":"Preprod","apiUrl":"https://preprod.example"}]' npm run dev
+```
+
+If the browser and Nightfrost use different origins, explicitly allow the
+wallet origin on the Nightfrost process that accepts submissions:
+
+```sh
+NIGHTFROST_SUBMIT_CORS_ORIGIN=http://localhost:5173 nightfrost
+```
+
+This setting grants only that exact origin access to `POST /api/v0/tx/submit`.
+It is unnecessary when the wallet and API are served from the same origin.
+Read-only GET routes keep their existing deployment CORS behavior.
+
+Transaction links use the hosted Nightfrost explorer by default. To use a local
+explorer:
+
+```sh
+VITE_EXPLORER_URL=http://127.0.0.1:5173 npm run dev
+```
+
+## What it demonstrates
+
+The example validates an English BIP39 phrase and derives account 0, index 0
+for all three Midnight roles:
+
+- Zswap for shielded state
+- NIGHT external at `m/44'/2400'/0'/0/0`
+- Dust for fee state
+
+It then builds three custom SDK wallet cores. All chain synchronization is
+polling through Nightfrost; there is no GraphQL wallet indexer, wallet session,
+WebSocket subscription, or direct node connection in the browser. Ledger-event
+deserialization, trial processing, transaction construction, signing, and WASM
+proving happen locally. Only public synchronization queries and the finalized
+serialized transaction reach Nightfrost.
+
+The Send tab currently demonstrates an unshielded native NIGHT transfer. Fees
+are selected from the wallet's synced DUST state. The adapter waits for a
+submitted transaction identifier to appear in Nightfrost before reporting it
+in-block.
+
+Nightfrost calls used by the SDK adapter are:
+
+- `GET /api/v0/stats`
+- `GET /api/v0/ledger-parameters/latest`
+- `GET /api/v0/ledger-events?from=...&order=asc`
+- `GET /api/v0/addresses/{address}/txs?from=...&order=asc`
+- `GET /api/v0/txs/{hash}`
+- `GET /api/v0/txs/{hash}/utxos`
+- `GET /api/v0/tx-identifiers/{identifier}`
+- `POST /api/v0/tx/submit`
+
+The first sync scans the raw Zswap and Dust event feed locally, so a fresh
+wallet may take time on a long-lived test network. Poll cursors are translated
+between Nightfrost's zero-based store IDs and the SDK's one-based progress
+sentinels by the local adapter.
+
+## Safety and scope
+
+Mainnet is intentionally disabled. This is an unaudited Preview/Preprod example,
+not a production wallet. Use only disposable test phrases and test funds.
+
+The phrase is cleared from the input after opening. Seed buffers and derived key
+buffers are cleared when initialization fails or the wallet is forgotten where
+the JavaScript and WASM APIs permit it. Browser JavaScript cannot guarantee
+secure memory erasure, so do not paste a phrase that protects real funds.
+
+The **Generate test phrase** button creates a fresh 24-word BIP39 phrase with
+browser cryptographic randomness. `STAR` is the smallest NIGHT unit:
+`1 NIGHT = 1,000,000 STAR`.

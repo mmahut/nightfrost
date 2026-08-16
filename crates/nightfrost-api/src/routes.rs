@@ -8,7 +8,10 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
-use nightfrost_core::store::{BlockRecord, NodeTipHeight, Store, TxRecord, meta_keys};
+use nightfrost_core::{
+    domain::{ProtocolVersion, ledger::LedgerState},
+    store::{BlockRecord, NodeTipHeight, Store, TxRecord, meta_keys},
+};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -131,7 +134,10 @@ pub(crate) fn next_cursor(
     Some(state.cursor_codec.encode(scope, anchor?, position?))
 }
 
-pub(crate) fn response<T>(state: &ApiState, results: T) -> Result<Json<PointResponse<T>>, ApiError> {
+pub(crate) fn response<T>(
+    state: &ApiState,
+    results: T,
+) -> Result<Json<PointResponse<T>>, ApiError> {
     Ok(Json(PointResponse {
         results,
         tip: current_tip(state)?.as_ref().map(Into::into),
@@ -291,6 +297,56 @@ pub async fn block_latest(
         .map_err(internal)?
         .ok_or_else(|| ApiError::not_found("block not found"))?;
     response(&state, BlockResponse::new(height, record))
+}
+
+/// Authoritative ledger parameters at the indexed tip. Wallet clients need
+/// the tagged binary form because fee calculation and transaction validation
+/// must use exactly the parameters applied by the ledger implementation.
+#[derive(Serialize)]
+pub struct LedgerParametersResponse {
+    pub block_hash: String,
+    pub block_height: u64,
+    pub block_time: u64,
+    pub protocol_version: u32,
+    pub ledger_parameters: String,
+}
+
+pub async fn ledger_parameters_latest(
+    State(state): State<AppState>,
+) -> Result<Json<PointResponse<LedgerParametersResponse>>, ApiError> {
+    let height = state
+        .store
+        .last_indexed_height()
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::not_found("no indexed block"))?;
+    let block = state
+        .store
+        .block(height)
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::internal("indexed tip block is missing"))?;
+    let state_key = block
+        .ledger_state_root
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("indexed tip has no persisted ledger state"))?;
+    let ledger_version = ProtocolVersion::try_from(block.protocol_version)
+        .map_err(internal)?
+        .ledger_version();
+    let ledger_state = LedgerState::load(state_key, ledger_version).map_err(internal)?;
+    let ledger_parameters = ledger_state
+        .ledger_parameters()
+        .serialize()
+        .map_err(internal)?;
+
+    response(
+        &state,
+        LedgerParametersResponse {
+            block_hash: const_hex::encode(block.hash),
+            block_height: height,
+            block_time: block.timestamp,
+            protocol_version: block.protocol_version,
+            ledger_parameters: const_hex::encode(ledger_parameters),
+        },
+    )
 }
 
 /// Resolve `{hash_or_height}`: decimal height or hex block hash.

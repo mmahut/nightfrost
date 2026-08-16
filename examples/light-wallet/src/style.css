@@ -1,0 +1,396 @@
+/* Reuse the explorer's design tokens and components so both examples stay in
+   the same visual system. This file only adds wallet-specific layout. */
+@import '../../explorer/src/style.css';
+
+.wallet-outlet {
+  min-height: calc(100vh - 150px);
+}
+
+.wallet-product {
+  padding-left: 10px;
+  border-left: 1px solid var(--hairline);
+  font-size: 0.78rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.wallet-header-spacer {
+  flex: 1;
+}
+
+.wallet-hero {
+  max-width: 920px;
+  margin: 64px auto 42px;
+}
+
+.wallet-hero-inner {
+  min-height: 430px;
+  justify-content: center;
+  padding: 62px clamp(24px, 7vw, 74px);
+}
+
+.wallet-kicker {
+  color: var(--accent);
+}
+
+.wallet-intro {
+  max-width: 680px;
+  font-size: 1rem;
+}
+
+.seed-form {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  width: min(100%, 760px);
+  margin-top: 7px;
+}
+
+.seed-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+}
+
+.seed-input {
+  width: 100%;
+  min-width: 0;
+  padding: 11px 14px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  color: var(--ink);
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.seed-input:focus {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--hairline));
+  box-shadow: 0 0 0 3px var(--glow);
+}
+
+.seed-reveal {
+  min-width: 54px;
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.seed-reveal:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--hairline));
+}
+
+.seed-submit {
+  min-height: 42px;
+  white-space: nowrap;
+}
+
+.seed-submit:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.seed-error {
+  color: var(--bad);
+  font-size: 0.86rem;
+  padding-top: 3px;
+}
+
+.seed-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  font-size: 0.78rem;
+}
+
+.seed-generate {
+  flex-shrink: 0;
+}
+
+.seed-note {
+  max-width: 760px;
+  font-size: 0.78rem;
+}
+
+.wallet-page-head {
+  justify-content: space-between;
+  align-items: flex-end;
+}
+
+.wallet-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+
+.wallet-tabs {
+  margin-bottom: 18px;
+}
+
+.wallet-tab-pane[hidden] {
+  display: none;
+}
+
+.wallet-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.forget-btn {
+  color: var(--bad);
+}
+
+.wallet-details {
+  background:
+    radial-gradient(600px 180px at 85% -60px, var(--glow), transparent 70%),
+    var(--panel);
+}
+
+.wallet-section-title {
+  font-size: 0.8rem;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+  margin: 4px 0 12px;
+}
+
+.wallet-txs-table .table-row {
+  cursor: default;
+}
+
+.wallet-txs-table .time-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tx-explorer-link {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.tx-explorer-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.receive-panel {
+  max-width: 860px;
+  margin: 0 auto 22px;
+  padding: clamp(22px, 5vw, 44px);
+  text-align: center;
+  background:
+    radial-gradient(680px 220px at 50% -90px, var(--glow), transparent 72%),
+    var(--panel);
+}
+
+.receive-panel .panel-title {
+  justify-content: center;
+  margin-bottom: 8px;
+}
+
+.receive-intro {
+  margin-bottom: 22px;
+}
+
+.receive-address-card {
+  padding: clamp(18px, 4vw, 30px);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--hairline));
+  border-radius: 4px;
+  background: var(--panel-soft);
+  text-align: left;
+}
+
+.receive-address {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  margin-top: 10px;
+  color: var(--accent);
+  font-size: 1.02rem;
+}
+
+.receive-address > .mono {
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+  scrollbar-width: thin;
+}
+
+.receive-hex {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--hairline);
+  font-size: 0.74rem;
+  text-align: left;
+}
+
+.receive-hex .mono {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.receive-warning {
+  max-width: 650px;
+  margin: 18px auto 0;
+  color: var(--warn);
+  font-size: 0.82rem;
+}
+
+.send-panel {
+  max-width: 860px;
+  margin: 0 auto 22px;
+  padding: clamp(22px, 5vw, 44px);
+  background:
+    radial-gradient(680px 220px at 50% -90px, var(--glow), transparent 72%),
+    var(--panel);
+}
+
+.send-panel .panel-title {
+  margin-bottom: 8px;
+}
+
+.send-form {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(150px, 1fr);
+  gap: 16px;
+  text-align: left;
+}
+
+.send-form .label {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.send-summary,
+.send-status {
+  grid-column: 1 / -1;
+}
+
+.send-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.send-submit {
+  min-height: 42px;
+  white-space: nowrap;
+}
+
+.send-submit:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.send-status {
+  min-height: 24px;
+  font-size: 0.86rem;
+}
+
+.send-success {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--good);
+}
+
+.mainnet-dialog {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: min(520px, calc(100vw - 32px));
+  padding: 30px;
+  border: 1px solid color-mix(in srgb, var(--bad) 50%, var(--hairline));
+  border-radius: 5px;
+  background: var(--panel);
+  color: var(--ink);
+  box-shadow: 0 18px 60px var(--shadow);
+}
+
+.mainnet-dialog::backdrop {
+  background: rgba(2, 6, 16, 0.78);
+  backdrop-filter: blur(4px);
+}
+
+.mainnet-dialog h2 {
+  margin: 7px 0 12px;
+  font-size: 1.35rem;
+}
+
+.mainnet-dialog p + p {
+  margin-top: 9px;
+}
+
+.dialog-icon {
+  color: var(--bad);
+  font-size: 1.6rem;
+}
+
+.dialog-close {
+  margin-top: 22px;
+  padding: 9px 18px;
+}
+
+@media (max-width: 640px) {
+  .wallet-product {
+    display: none;
+  }
+
+  .wallet-hero {
+    margin-top: 26px;
+  }
+
+  .wallet-hero-inner {
+    min-height: 0;
+    padding: 38px 22px;
+  }
+
+  .seed-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .seed-submit {
+    grid-column: 1 / -1;
+    padding: 10px 18px;
+  }
+
+  .seed-tools {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .wallet-page-head {
+    align-items: flex-start;
+  }
+
+  .send-form {
+    grid-template-columns: 1fr;
+  }
+
+  .send-summary,
+  .send-status {
+    grid-column: 1;
+  }
+
+  .send-summary {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+}

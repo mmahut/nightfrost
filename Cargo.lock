@@ -1539,8 +1539,6 @@ dependencies = [
 [[package]]
 name = "fjall"
 version = "2.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b25ad44cd4360a0448a9b5a0a6f1c7a621101cca4578706d43c9a821418aebc"
 dependencies = [
  "byteorder",
  "byteview",
@@ -3508,7 +3506,9 @@ dependencies = [
  "nightfrost-chain",
  "nightfrost-core",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
+ "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3548,6 +3548,7 @@ dependencies = [
  "nightfrost-core",
  "parity-scale-codec",
  "serde",
+ "sha2 0.11.0",
  "subxt",
  "thiserror 2.0.19",
  "tokio",
