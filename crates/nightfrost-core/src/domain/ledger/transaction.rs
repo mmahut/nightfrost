@@ -12,8 +12,7 @@
 // limitations under the License.
 
 // Vendored and adapted from midnight-indexer
-// (indexer-common/src/domain/ledger/transaction.rs). Wallet-sync trial
-// decryption (`relevant`, `can_decrypt_v8`/`can_decrypt_v9`) is dropped.
+// (indexer-common/src/domain/ledger/transaction.rs).
 
 use crate::{
     domain::{
@@ -24,15 +23,26 @@ use crate::{
     ledger_db::FjallLedgerDb,
 };
 use futures::{StreamExt, TryStreamExt};
-use midnight_coin_structure_v2::contract::ContractAddress;
-use midnight_coin_structure_v3::contract::ContractAddress as ContractAddressV9;
+use midnight_coin_structure_v2::{coin::Info, contract::ContractAddress};
+use midnight_coin_structure_v3::{
+    coin::Info as InfoV9, contract::ContractAddress as ContractAddressV9,
+};
 use midnight_ledger_v8::structure::{
-    ContractAction as ContractActionV8, SystemTransaction as LedgerSystemTransactionV8,
+    ContractAction as ContractActionV8, StandardTransaction as StandardTransactionV8,
+    SystemTransaction as LedgerSystemTransactionV8,
 };
 use midnight_ledger_v9::structure::{
-    ContractAction as ContractActionV9, SystemTransaction as LedgerSystemTransactionV9,
+    ContractAction as ContractActionV9, StandardTransaction as StandardTransactionV9,
+    SystemTransaction as LedgerSystemTransactionV9,
 };
-use midnight_serialize_v1::tagged_deserialize;
+use midnight_serialize_v1::{Deserializable, tagged_deserialize};
+use midnight_storage_core_v1::db::DB;
+use midnight_transient_crypto_v2::{encryption::SecretKey, proofs::Proof};
+use midnight_transient_crypto_v3::{
+    encryption::SecretKey as SecretKeyV9, proofs::Proof as ProofV9,
+};
+use midnight_zswap_v8::Offer as OfferV8;
+use midnight_zswap_v9::Offer as OfferV9;
 use std::error::Error as StdError;
 
 #[derive(Debug, Clone)]
@@ -235,6 +245,51 @@ impl Transaction {
             },
         }
     }
+
+    /// Check whether this transaction contains an output decryptable by the
+    /// supplied Zswap encryption secret key.
+    pub fn relevant(&self, viewing_key: &[u8; 32]) -> bool {
+        match self {
+            Self::V8(transaction) => match transaction {
+                TransactionV8::Standard(StandardTransactionV8 {
+                    guaranteed_coins,
+                    fallible_coins,
+                    ..
+                }) => {
+                    let secret_key: Option<_> = SecretKey::from_repr(viewing_key).into();
+                    let Some(secret_key) = secret_key else {
+                        return false;
+                    };
+                    guaranteed_coins
+                        .as_ref()
+                        .is_some_and(|offer| can_decrypt_v8(&secret_key, offer))
+                        || fallible_coins
+                            .values()
+                            .any(|offer| can_decrypt_v8(&secret_key, &offer))
+                }
+                TransactionV8::ClaimRewards(_) => false,
+            },
+            Self::V9(transaction) => match transaction {
+                TransactionV9::Standard(StandardTransactionV9 {
+                    guaranteed_coins,
+                    fallible_coins,
+                    ..
+                }) => {
+                    let secret_key: Option<_> = SecretKeyV9::from_repr(viewing_key).into();
+                    let Some(secret_key) = secret_key else {
+                        return false;
+                    };
+                    guaranteed_coins
+                        .as_ref()
+                        .is_some_and(|offer| can_decrypt_v9(&secret_key, offer))
+                        || fallible_coins
+                            .values()
+                            .any(|offer| can_decrypt_v9(&secret_key, &offer))
+                }
+                TransactionV9::ClaimRewards(_) => false,
+            },
+        }
+    }
 }
 
 /// Facade for `SystemTransaction` from `midnight_ledger` across supported (protocol) versions.
@@ -288,4 +343,71 @@ fn serialize_contract_address_v9(
     address
         .serialize()
         .map_err(|error| Error::Serialize("ContractAddressV9", error))
+}
+
+/// Decode either the 32-byte scalar representation used internally or the
+/// 33-byte untagged serialization returned by the official wallet WASM SDK.
+pub fn viewing_key_repr(serialized: &[u8]) -> Option<[u8; 32]> {
+    if let Ok(raw) = <[u8; 32]>::try_from(serialized) {
+        return Some(raw);
+    }
+
+    let mut input = serialized;
+    let key = <SecretKey as Deserializable>::deserialize(&mut input, 0).ok()?;
+    if !input.is_empty() {
+        return None;
+    }
+    Some(key.repr())
+}
+
+fn can_decrypt_v8<D: DB>(key: &SecretKey, offer: &OfferV8<Proof, D>) -> bool {
+    let outputs = offer
+        .outputs
+        .iter()
+        .filter_map(|output| output.ciphertext.clone());
+    let transient = offer
+        .transient
+        .iter()
+        .filter_map(|output| output.ciphertext.clone());
+
+    outputs.chain(transient).any(|ciphertext| {
+        key.decrypt::<Info>(&(*ciphertext).to_owned().into())
+            .is_some()
+    })
+}
+
+fn can_decrypt_v9<D: DB>(key: &SecretKeyV9, offer: &OfferV9<ProofV9, D>) -> bool {
+    let outputs = offer
+        .outputs
+        .iter()
+        .filter_map(|output| output.ciphertext.clone());
+    let transient = offer
+        .transient
+        .iter()
+        .filter_map(|output| output.ciphertext.clone());
+
+    outputs.chain(transient).any(|ciphertext| {
+        key.decrypt::<InfoV9>(&(*ciphertext).to_owned().into())
+            .is_some()
+    })
+}
+
+#[cfg(test)]
+mod viewing_key_tests {
+    use super::viewing_key_repr;
+    use midnight_serialize_v1::Serializable;
+    use midnight_zswap_v8::keys::{SecretKeys, Seed};
+
+    #[test]
+    fn accepts_raw_and_wallet_sdk_serialized_keys() {
+        let key = SecretKeys::from(Seed::from([7u8; 32])).encryption_secret_key;
+        let raw: [u8; 32] = key.repr();
+        let mut serialized = Vec::new();
+        Serializable::serialize(&key, &mut serialized).unwrap();
+
+        assert_eq!(serialized.len(), 33);
+        assert_eq!(viewing_key_repr(&raw), Some(raw));
+        assert_eq!(viewing_key_repr(&serialized), Some(raw));
+        assert_eq!(viewing_key_repr(&[0u8; 34]), None);
+    }
 }

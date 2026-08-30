@@ -9,7 +9,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use nightfrost_api::routes::ApiState;
 use nightfrost_chain::{pipeline, subxt_node::SubxtNode};
-use nightfrost_core::{ledger_db, store::Store};
+use nightfrost_core::{domain::ledger::LedgerState, ledger_db, store::Store};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
@@ -78,7 +78,7 @@ struct Args {
     /// Ledger arena node-cache size (node count, not bytes). The 10k default
     /// is storage-core's own bootstrap value; catch-up replay walks merkle
     /// paths far larger than that, so raising it trades memory for fewer
-    /// fjall reads (docs/ROADMAP.md 2b).
+    /// fjall reads.
     #[arg(
         long,
         global = true,
@@ -87,16 +87,15 @@ struct Args {
     )]
     ledger_cache_nodes: usize,
 
-    /// One-off maintenance: measure contract-state duplication (see
-    /// docs/CONTRACT_STATE.md), then exit. Read-only; run with the
-    /// indexer stopped. Only meaningful on a pre-migration store.
+    /// One-off maintenance: measure contract-state duplication, then
+    /// exit. Read-only; run with the indexer stopped. Only meaningful
+    /// on a pre-migration store.
     #[arg(long)]
     measure_contract_states: bool,
 
     /// One-off maintenance: migrate a schema-1 store to content-addressed
-    /// contract states (docs/CONTRACT_STATE.md), then exit. Resumable; run
-    /// with the indexer stopped. A rerun after cutover reclaims the legacy
-    /// partition.
+    /// contract states, then exit. Resumable; run with the indexer
+    /// stopped. A rerun after cutover reclaims the legacy partition.
     #[arg(long)]
     backfill_contract_states: bool,
 }
@@ -297,6 +296,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
     );
     tracing::info!(data_dir = %args.data_dir, "store opened");
 
+    let wallet_sidecars = match store.ledger_state_window()?.0.last() {
+        Some((key, version)) => {
+            let ledger_state = LedgerState::load(key, (*version).into())
+                .context("load tip ledger state for wallet side-index backfill")?;
+            backfill::backfill_wallet_sidecars(&store, ledger_state.zswap_first_free())?
+        }
+        None => backfill::backfill_wallet_sidecars(&store, 0)?,
+    };
+    if wallet_sidecars.transactions_indexed > 0 || wallet_sidecars.dust_events_indexed > 0 {
+        tracing::info!(?wallet_sidecars, "wallet side indexes backfilled");
+    }
+
     let node = SubxtNode::new(nightfrost_chain::subxt_node::Config::new(&args.node_url))
         .await
         .with_context(|| format!("connect to node {}", args.node_url))?;
@@ -322,6 +333,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         node_url: args.node_url,
         highest_block,
         cursor_codec: nightfrost_api::pagination::CursorCodec::new(cursor_key),
+        wallet_scan_lock: Arc::new(std::sync::Mutex::new(())),
     });
     let submit_router = axum::Router::new()
         .route("/api/v0/tx/submit", axum::routing::post(submit_tx))

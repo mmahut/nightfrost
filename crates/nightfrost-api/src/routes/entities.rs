@@ -1,8 +1,8 @@
 //! Transaction, address, contract, dust and ledger-event endpoints.
 
 use super::{
-    ApiResponse, ApiState, PointResponse, internal, next_cursor, page_context, response,
-    response_at,
+    ApiResponse, ApiState, PointResponse, current_tip, internal, next_cursor, page_context,
+    response, response_at,
 };
 use crate::{
     error::ApiError,
@@ -11,18 +11,22 @@ use crate::{
 use axum::{
     Json,
     extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, header::CACHE_CONTROL},
 };
 use nightfrost_core::{
     domain::{
-        LedgerEventAttributes, LedgerEventGrouping, TransactionResult, TransactionVariant,
-        UnshieldedUtxo,
+        LedgerEventAttributes, LedgerEventGrouping, ProtocolVersion, TransactionResult,
+        TransactionVariant, UnshieldedUtxo,
+        ledger::{LedgerState, Transaction},
     },
     store::{
-        self, CnightRegistrationRecord, ContractActionRecord, EventRecord, TxRecord, key_u64_suffix,
+        self, CnightRegistrationRecord, ContractActionRecord, EventRecord, Store, TxRecord,
+        WalletTxIndexRecord, key_u64_suffix, meta_keys,
     },
 };
 use serde::{Deserialize, Serialize};
-use std::{ops::Bound, sync::Arc};
+use sha2::{Digest, Sha256};
+use std::{collections::HashMap, ops::Bound, sync::Arc};
 
 type AppState = Arc<ApiState>;
 
@@ -133,9 +137,9 @@ pub async fn tx_by_identifier(
 ) -> Result<Json<PointResponse<TxResponse>>, ApiError> {
     let identifier = const_hex::decode(identifier.trim_start_matches("0x"))
         .map_err(|_| ApiError::bad_request("invalid transaction identifier"))?;
-    if identifier.len() != 32 {
+    if identifier.len() != 33 {
         return Err(ApiError::bad_request(
-            "transaction identifier must be 32 bytes",
+            "transaction identifier must be 33 bytes",
         ));
     }
     let tx_id = state
@@ -780,6 +784,66 @@ mod event_cursor_tests {
     }
 
     #[tokio::test]
+    async fn wallet_feed_advances_cleanly_on_an_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(ApiState {
+            store: Arc::new(Store::open(dir.path()).unwrap()),
+            network_id: "test".into(),
+            node_url: "ws://node".into(),
+            highest_block: Arc::new(RwLock::new(None)),
+            cursor_codec: CursorCodec::new(b"test key"),
+            wallet_scan_lock: Arc::new(std::sync::Mutex::new(())),
+        });
+
+        let (headers, Json(response)) = wallet_events(
+            State(state.clone()),
+            Json(WalletEventsRequest {
+                viewing_key: const_hex::encode([0u8; 32]),
+                from: 0,
+                count: 5_000,
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(headers[CACHE_CONTROL], "no-store");
+        assert!(response.results.events.is_empty());
+        assert_eq!(response.results.scanned_through, 0);
+        assert_eq!(response.results.highest_event_id, 0);
+        assert!(response.next_cursor.is_none());
+
+        let (headers, Json(response)) = wallet_shielded_sync(
+            State(state.clone()),
+            Json(ShieldedSyncRequest {
+                viewing_key: const_hex::encode([0u8; 32]),
+                from_index: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(headers[CACHE_CONTROL], "no-store");
+        assert!(response.results.updates.is_empty());
+        assert_eq!(response.results.applied_through, 0);
+        assert_eq!(response.results.highest_index, 0);
+        assert_eq!(response.results.scanned_transactions, 0);
+
+        let (headers, Json(response)) = wallet_dust_sync(
+            State(state),
+            Query(DustSyncRequest {
+                from: 0,
+                count: 50_000,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(headers[CACHE_CONTROL], "public, max-age=2");
+        assert!(response.results.events.is_empty());
+        assert_eq!(response.results.scanned_through, 0);
+        assert_eq!(response.results.highest_event_id, 0);
+    }
+
+    #[tokio::test]
     async fn contracts_seek_from_the_opaque_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
@@ -823,6 +887,7 @@ mod event_cursor_tests {
             node_url: "ws://node".into(),
             highest_block: Arc::new(RwLock::new(Some(0))),
             cursor_codec: CursorCodec::new(b"test key"),
+            wallet_scan_lock: Arc::new(std::sync::Mutex::new(())),
         });
 
         let first = contracts(
@@ -922,7 +987,164 @@ pub async fn ledger_events(
     response_at(&state, events, page.anchor, next)
 }
 
-/// Per-contract event cursor feed, shaped like `/ledger-events`: events (with
+#[derive(Deserialize)]
+pub struct WalletEventsRequest {
+    pub viewing_key: String,
+    #[serde(default)]
+    pub from: u64,
+    #[serde(default = "wallet_events_default_count")]
+    pub count: usize,
+    pub cursor: Option<String>,
+}
+
+fn wallet_events_default_count() -> usize {
+    5_000
+}
+
+#[derive(Serialize)]
+pub struct WalletEventResponse {
+    #[serde(flatten)]
+    pub event: EventResponse,
+    pub relevant: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct WalletEventsResult {
+    pub events: Vec<WalletEventResponse>,
+    /// One past the last raw ledger-event ID examined, including irrelevant events.
+    pub scanned_through: u64,
+    /// One past the latest ledger-event ID currently indexed.
+    pub highest_event_id: u64,
+}
+
+/// Stateless wallet feed. The supplied Zswap encryption secret key is used
+/// only for trial decryption during this request and is never persisted. The
+/// response remains chain-complete for wallet replay: every Zswap and DUST event
+/// is returned, with Zswap relevance annotated; contract events are omitted.
+pub async fn wallet_events(
+    State(state): State<AppState>,
+    Json(request): Json<WalletEventsRequest>,
+) -> Result<(HeaderMap, Json<ApiResponse<WalletEventsResult>>), ApiError> {
+    let viewing_key_bytes = const_hex::decode(request.viewing_key.trim_start_matches("0x"))
+        .map_err(|_| ApiError::bad_request("viewing_key must be hex-encoded"))?;
+    let viewing_key = nightfrost_core::domain::ledger::viewing_key_repr(&viewing_key_bytes)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "viewing_key must be a raw 32-byte key or official SDK serialization",
+            )
+        })?;
+    let pagination = Pagination {
+        count: request.count,
+        order: Order::Asc,
+        cursor: request.cursor,
+        page: None,
+    };
+    let query_scope = scope(
+        &[b"wallet_events", &request.from.to_be_bytes(), &viewing_key],
+        Order::Asc,
+    );
+    let page = page_context(&state, &pagination, &query_scope)?;
+    let position = page
+        .position
+        .as_deref()
+        .map(|bytes| {
+            bytes
+                .try_into()
+                .map(u64::from_be_bytes)
+                .map_err(|_| ApiError::bad_request("invalid wallet event cursor position"))
+        })
+        .transpose()?;
+    let lower = position
+        .map(|id| Bound::Excluded(id.to_be_bytes().to_vec()))
+        .unwrap_or_else(|| Bound::Included(request.from.to_be_bytes().to_vec()));
+    let mut events = Vec::new();
+    let mut scanned = 0usize;
+    let mut scanned_through = request.from;
+    let mut cursor_position = None;
+    let mut has_more = false;
+    let mut relevant_txs = HashMap::<u64, bool>::new();
+
+    for entry in state.store.ledger_events.range((lower, Bound::Unbounded)) {
+        let (key, value) = entry.map_err(internal)?;
+        let id = u64::from_be_bytes(key.as_ref().try_into().expect("8-byte event id"));
+        let record: EventRecord = store::decode(&value);
+        if page
+            .anchor
+            .as_ref()
+            .is_some_and(|tip| record.block_height > tip.height)
+        {
+            continue;
+        }
+        if scanned == pagination.count {
+            has_more = true;
+            break;
+        }
+
+        scanned += 1;
+        scanned_through = id.saturating_add(1);
+        cursor_position = Some(id.to_be_bytes());
+        let relevance = match record.event.grouping {
+            LedgerEventGrouping::Dust => None,
+            LedgerEventGrouping::Contract => continue,
+            LedgerEventGrouping::Zswap => Some({
+                if let Some(relevant) = relevant_txs.get(&record.tx_id) {
+                    *relevant
+                } else {
+                    let tx = state
+                        .store
+                        .tx(record.tx_id)
+                        .map_err(internal)?
+                        .ok_or_else(|| {
+                            ApiError::internal("missing transaction for wallet event")
+                        })?;
+                    let relevant = if tx.variant == TransactionVariant::Regular {
+                        let block = state
+                            .store
+                            .block(tx.block_height)
+                            .map_err(internal)?
+                            .ok_or_else(|| ApiError::internal("missing block for wallet event"))?;
+                        let ledger_version = ProtocolVersion::try_from(block.protocol_version)
+                            .map_err(internal)?
+                            .ledger_version();
+                        Transaction::deserialize(&tx.raw, ledger_version)
+                            .map_err(internal)?
+                            .relevant(&viewing_key)
+                    } else {
+                        false
+                    };
+                    relevant_txs.insert(record.tx_id, relevant);
+                    relevant
+                }
+            }),
+        };
+        events.push(WalletEventResponse {
+            event: EventResponse::new(&state, id, record)?,
+            relevant: relevance,
+        });
+    }
+
+    let next = next_cursor(
+        &state,
+        &query_scope,
+        page.anchor.as_ref(),
+        cursor_position.as_ref().map(|position| position.as_slice()),
+        has_more,
+    );
+    let results = WalletEventsResult {
+        events,
+        scanned_through,
+        highest_event_id: state
+            .store
+            .next_id(meta_keys::NEXT_EVENT_ID)
+            .map_err(internal)?,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let response = response_at(&state, results, page.anchor, next)?;
+    Ok((headers, response))
+}
+
+/// Per-contract event cursor feed, shaped like `/ledger/events`: events (with
 /// their transaction and correlation context) plus the next cursor. Restricted
 /// to events emitted by exactly this contract.
 #[derive(Serialize)]
@@ -1303,4 +1525,349 @@ pub async fn dust_generation_status(
             max_capacity: max_capacity.to_string(),
         },
     )
+}
+#[derive(Deserialize)]
+pub struct ShieldedSyncRequest {
+    pub viewing_key: String,
+    #[serde(default)]
+    pub from_index: u64,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShieldedSyncUpdate {
+    Collapsed {
+        from_index: u64,
+        to_index: u64,
+        protocol_version: u32,
+        update: String,
+    },
+    Transaction {
+        from_index: u64,
+        to_index: u64,
+        protocol_version: u32,
+        tx_id: u64,
+        tx_hash: String,
+        events: Vec<EventResponse>,
+    },
+}
+
+#[derive(Serialize)]
+pub struct ShieldedSyncResult {
+    pub updates: Vec<ShieldedSyncUpdate>,
+    pub applied_through: u64,
+    pub highest_index: u64,
+    pub scanned_transactions: u64,
+}
+
+fn wallet_relevance_key(viewing_hash: &[u8; 32], tx_id: u64) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    key[..32].copy_from_slice(viewing_hash);
+    key[32..].copy_from_slice(&tx_id.to_be_bytes());
+    key
+}
+
+fn scan_wallet_relevance(
+    store: &Store,
+    viewing_hash: &[u8; 32],
+    viewing_key: &[u8; 32],
+    target_tx: u64,
+) -> Result<(), String> {
+    let mut scanned = store
+        .wallet_scan_progress
+        .get(viewing_hash)
+        .map_err(|error| error.to_string())?
+        .map(|value| u64::from_be_bytes(value.as_ref().try_into().expect("8-byte progress")))
+        .unwrap_or(0);
+    while scanned < target_tx {
+        let batch_end = target_tx.min(scanned + 1_000);
+        let mut batch = store.batch();
+        for tx_id in scanned..batch_end {
+            let tx = store
+                .tx(tx_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("missing transaction {tx_id}"))?;
+            if tx.variant != TransactionVariant::Regular {
+                continue;
+            }
+            let index = store
+                .wallet_tx_indices
+                .get(tx_id.to_be_bytes())
+                .map_err(|error| error.to_string())?
+                .map(|value| store::decode::<WalletTxIndexRecord>(&value))
+                .ok_or_else(|| format!("missing wallet transaction index {tx_id}"))?;
+            let ledger_version = ProtocolVersion::try_from(index.protocol_version)
+                .map_err(|error| error.to_string())?
+                .ledger_version();
+            if Transaction::deserialize(&tx.raw, ledger_version)
+                .map_err(|error| error.to_string())?
+                .relevant(viewing_key)
+            {
+                batch.insert(
+                    &store.wallet_relevant_txs,
+                    wallet_relevance_key(viewing_hash, tx_id),
+                    [],
+                );
+            }
+        }
+        scanned = batch_end;
+        batch.insert(
+            &store.wallet_scan_progress,
+            viewing_hash,
+            scanned.to_be_bytes(),
+        );
+        batch.commit().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Fast shielded-wallet bootstrap: only relevant transaction events cross the
+/// wire; concise authenticated Merkle updates cover every irrelevant gap.
+pub async fn wallet_shielded_sync(
+    State(state): State<AppState>,
+    Json(request): Json<ShieldedSyncRequest>,
+) -> Result<(HeaderMap, Json<PointResponse<ShieldedSyncResult>>), ApiError> {
+    let viewing_key_bytes = const_hex::decode(request.viewing_key.trim_start_matches("0x"))
+        .map_err(|_| ApiError::bad_request("viewing_key must be hex-encoded"))?;
+    let viewing_key = nightfrost_core::domain::ledger::viewing_key_repr(&viewing_key_bytes)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "viewing_key must be a raw 32-byte key or official SDK serialization",
+            )
+        })?;
+    let viewing_hash: [u8; 32] = Sha256::digest(viewing_key).into();
+    let tip = current_tip(&state)?;
+    let target_tx = match tip.as_ref() {
+        Some(tip) => {
+            let block = state
+                .store
+                .block(tip.height)
+                .map_err(internal)?
+                .ok_or_else(|| ApiError::internal("indexed tip block is missing"))?;
+            block.first_tx_id + u64::from(block.tx_count)
+        }
+        None => 0,
+    };
+
+    let scan_store = state.store.clone();
+    let scan_lock = state.wallet_scan_lock.clone();
+    tokio::task::spawn_blocking(move || {
+        let _guard = scan_lock
+            .lock()
+            .map_err(|_| "wallet scan lock poisoned".to_string())?;
+        scan_wallet_relevance(&scan_store, &viewing_hash, &viewing_key, target_tx)
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
+
+    if target_tx == 0 {
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return Ok((
+            headers,
+            Json(PointResponse {
+                results: ShieldedSyncResult {
+                    updates: vec![],
+                    applied_through: 0,
+                    highest_index: 0,
+                    scanned_transactions: 0,
+                },
+                tip: None,
+            }),
+        ));
+    }
+
+    // Anchor the response to the same transaction boundary used by the
+    // relevance scan. The live pipeline may append another block while this
+    // request is building its response; using the newest tree first-free
+    // index here would skip relevance testing for that block.
+    let highest_index = state
+        .store
+        .wallet_tx_indices
+        .get((target_tx - 1).to_be_bytes())
+        .map_err(internal)?
+        .map(|value| store::decode::<WalletTxIndexRecord>(&value).zswap_end_index)
+        .ok_or_else(|| ApiError::internal("missing wallet transaction index at sync boundary"))?;
+    let window = state.store.ledger_state_window().map_err(internal)?;
+    let (ledger_key, ledger_version) = window
+        .0
+        .last()
+        .ok_or_else(|| ApiError::internal("wallet sync requires a persisted ledger state"))?;
+    let ledger_state = LedgerState::load(ledger_key, (*ledger_version).into()).map_err(internal)?;
+    if ledger_state.zswap_first_free() < highest_index {
+        return Err(ApiError::internal(
+            "persisted ledger state is behind the wallet sync boundary",
+        ));
+    }
+    if request.from_index > highest_index {
+        return Err(ApiError::bad_request("from_index is beyond the Zswap tree"));
+    }
+    let protocol_version = tip
+        .as_ref()
+        .and_then(|tip| state.store.block(tip.height).ok().flatten())
+        .map(|block| block.protocol_version)
+        .ok_or_else(|| ApiError::internal("indexed tip block is missing"))?;
+
+    let mut updates = Vec::new();
+    let mut applied_through = request.from_index;
+    for entry in state.store.wallet_relevant_txs.prefix(viewing_hash) {
+        let (key, _) = entry.map_err(internal)?;
+        let tx_id = key_u64_suffix(&key);
+        if tx_id >= target_tx {
+            break;
+        }
+        let index = state
+            .store
+            .wallet_tx_indices
+            .get(tx_id.to_be_bytes())
+            .map_err(internal)?
+            .map(|value| store::decode::<WalletTxIndexRecord>(&value))
+            .ok_or_else(|| ApiError::internal("missing wallet transaction index"))?;
+        if index.zswap_end_index <= applied_through {
+            continue;
+        }
+        if index.zswap_start_index < applied_through {
+            return Err(ApiError::bad_request(
+                "from_index falls inside a relevant transaction",
+            ));
+        }
+        if applied_through < index.zswap_start_index {
+            updates.push(ShieldedSyncUpdate::Collapsed {
+                from_index: applied_through,
+                to_index: index.zswap_start_index,
+                protocol_version,
+                update: const_hex::encode(
+                    ledger_state
+                        .make_zswap_collapsed_update(applied_through, index.zswap_start_index - 1)
+                        .map_err(internal)?,
+                ),
+            });
+        }
+        let tx = state
+            .store
+            .tx(tx_id)
+            .map_err(internal)?
+            .ok_or_else(|| ApiError::internal("missing relevant transaction"))?;
+        let events = (tx.first_event_id..tx.first_event_id + u64::from(tx.event_count))
+            .filter_map(|event_id| {
+                let value = match state.store.ledger_events.get(event_id.to_be_bytes()) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        return Some(Err(ApiError::internal("missing relevant event")));
+                    }
+                    Err(error) => return Some(Err(internal(error))),
+                };
+                let record: EventRecord = store::decode(&value);
+                matches!(record.event.grouping, LedgerEventGrouping::Zswap)
+                    .then(|| EventResponse::new(&state, event_id, record))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        updates.push(ShieldedSyncUpdate::Transaction {
+            from_index: index.zswap_start_index,
+            to_index: index.zswap_end_index,
+            protocol_version: index.protocol_version,
+            tx_id,
+            tx_hash: const_hex::encode(tx.hash),
+            events,
+        });
+        applied_through = index.zswap_end_index;
+    }
+    if applied_through < highest_index {
+        updates.push(ShieldedSyncUpdate::Collapsed {
+            from_index: applied_through,
+            to_index: highest_index,
+            protocol_version,
+            update: const_hex::encode(
+                ledger_state
+                    .make_zswap_collapsed_update(applied_through, highest_index - 1)
+                    .map_err(internal)?,
+            ),
+        });
+        applied_through = highest_index;
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((
+        headers,
+        Json(PointResponse {
+            results: ShieldedSyncResult {
+                updates,
+                applied_through,
+                highest_index,
+                scanned_transactions: target_tx,
+            },
+            tip: tip.as_ref().map(Into::into),
+        }),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct DustSyncRequest {
+    #[serde(default)]
+    pub from: u64,
+    #[serde(default = "wallet_events_default_count")]
+    pub count: usize,
+}
+
+#[derive(Serialize)]
+pub struct DustSyncResult {
+    pub events: Vec<EventResponse>,
+    pub scanned_through: u64,
+    pub highest_event_id: u64,
+}
+
+/// Direct DUST-only replay feed backed by a side index.
+pub async fn wallet_dust_sync(
+    State(state): State<AppState>,
+    Query(request): Query<DustSyncRequest>,
+) -> Result<(HeaderMap, Json<PointResponse<DustSyncResult>>), ApiError> {
+    if !(1..=50_000).contains(&request.count) {
+        return Err(ApiError::bad_request(
+            "count should be within range 1-50000",
+        ));
+    }
+    let highest_event_id = state
+        .store
+        .next_id(meta_keys::NEXT_EVENT_ID)
+        .map_err(internal)?;
+    let mut events = Vec::new();
+    for entry in state.store.wallet_dust_events.range((
+        Bound::Included(request.from.to_be_bytes().to_vec()),
+        Bound::Unbounded,
+    )) {
+        let (key, _) = entry.map_err(internal)?;
+        let event_id = u64::from_be_bytes(key.as_ref().try_into().expect("8-byte event id"));
+        let value = state
+            .store
+            .ledger_events
+            .get(event_id.to_be_bytes())
+            .map_err(internal)?
+            .ok_or_else(|| ApiError::internal("missing DUST event"))?;
+        events.push(EventResponse::new(&state, event_id, store::decode(&value))?);
+        if events.len() == request.count {
+            break;
+        }
+    }
+    let scanned_through = events
+        .last()
+        .map(|event| event.id + 1)
+        .unwrap_or(request.from);
+    let scanned_through = if events.len() < request.count {
+        highest_event_id
+    } else {
+        scanned_through
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("public, max-age=2"));
+    response(
+        &state,
+        DustSyncResult {
+            events,
+            scanned_through,
+            highest_event_id,
+        },
+    )
+    .map(|json| (headers, json))
 }

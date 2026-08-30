@@ -3,7 +3,11 @@ pub mod metrics;
 pub mod pagination;
 pub mod routes;
 
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    extract::DefaultBodyLimit,
+    routing::{get, post},
+};
 use routes::ApiState;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -14,7 +18,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/metrics", get(metrics::metrics))
         .route("/api/v0/network", get(routes::network))
-        .route("/api/v0/sync-status", get(routes::sync_status))
+        .route("/api/v0/sync", get(routes::sync_status))
         .route("/api/v0/stats", get(routes::stats))
         .route("/api/v0/blocks/latest", get(routes::block_latest))
         .route(
@@ -54,7 +58,16 @@ pub fn router(state: Arc<ApiState>) -> Router {
             "/api/v0/contracts/{addr}/events",
             get(entities::contract_events),
         )
-        .route("/api/v0/ledger-events", get(entities::ledger_events))
+        .route("/api/v0/ledger/events", get(entities::ledger_events))
+        .route(
+            "/api/v0/wallet-sync/shielded",
+            post(entities::wallet_shielded_sync).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route("/api/v0/wallet-sync/dust", get(entities::wallet_dust_sync))
+        .route(
+            "/api/v0/wallet/events",
+            post(entities::wallet_events).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
         .route(
             "/api/v0/dust/registrations",
             get(entities::dust_registrations),
@@ -64,7 +77,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
             get(entities::dust_registrations_by_stake),
         )
         .route(
-            "/api/v0/dust/generation-status/{stake_key}",
+            "/api/v0/dust/status/{stake_key}",
             get(entities::dust_generation_status),
         )
         .layer(CorsLayer::permissive())

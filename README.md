@@ -7,9 +7,9 @@
 
 <div align="center">
 
-[![Hosted API](https://img.shields.io/badge/Hosted%20API-nightfrost.dev-4c1?&logoColor=white&color=pink)](https://docs.nightfrost.dev)
-![GitHub Release](https://img.shields.io/github/v/release/mmahut/nightfrost)
-[![Build and test](https://github.com/mmahut/nightfrost/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/mmahut/fence/nightfrost/workflows/main.yml)
+[![Hosted API](https://img.shields.io/badge/Hosted%20API-nightfrost.dev-4c1?&logoColor=white&color=pink)](https://nightfrost.dev)
+[![GitHub Release](https://img.shields.io/github/v/release/mmahut/nightfrost)](https://github.com/mmahut/nightfrost/releases/latest)
+[![Build and test](https://github.com/mmahut/nightfrost/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mmahut/nightfrost/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-nightfrost.dev-4c1?logo=bookstack&logoColor=white&color=mediumslateblue)](https://docs.nightfrost.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
@@ -38,11 +38,11 @@ Live version is at [nightfrost.dev](https://nightfrost.dev)
 
 ### Recommended requirements
 
-- 2Ghz vCPU 
-- 4GB of RAM
-- 4GB of Storage for Preview
-- 100GB of Storage for Preprod
-- 70GB of Storage for Mainnet
+- 1 vCPU 
+- 4GB of RAM per network
+- 3GB of Storage for Preview
+- 180GB of Storage for Preprod 
+- 60GB of Storage for Mainnet 
 
 ### Building
 
@@ -88,6 +88,10 @@ REST API.
 
 * `examples/light-wallet/` is an experimental, Midnight wallet example.
    * Demo at [wallet.nightfrost.dev](https://wallet.nightfrost.dev).
+
+* `examples/faucet/` is a test-funds faucet handing out 1.337 NIGHT per claim
+on preview and preprod.
+   * Demo at [faucet.nightfrost.dev](https://faucet.nightfrost.dev).
 ## REST API
 
 The OpenAPI documentation lives at [docs.nightfrost.dev](https://docs.nightfrost.dev).

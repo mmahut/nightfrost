@@ -20,7 +20,7 @@ npm run dev
 Open `http://localhost:5173`. The default network picker expects:
 
 - Preview at `https://preview.nightfrost.dev`
-- Preprod at `http://127.0.0.1:3101`
+- Preprod at `https://preprod.nightfrost.dev`
 
 Override those URLs while retaining the fixed network definitions:
 
@@ -59,11 +59,13 @@ It then builds three custom SDK wallet cores. All chain synchronization is
 polling through Nightfrost; there is no GraphQL wallet indexer, wallet session,
 WebSocket subscription, or direct node connection in the browser. Ledger-event
 deserialization, trial processing, transaction construction, signing, and WASM
-proving happen locally. Only public synchronization queries and the finalized
-serialized transaction reach Nightfrost.
+proving happen locally. The adapter submits the view-only Zswap encryption secret key to Nightfrost for stateless trial decryption; spending keys remain local. The finalized serialized transaction also reaches Nightfrost when sent.
 
-The Send tab currently demonstrates an unshielded native NIGHT transfer. Fees
-are selected from the wallet's synced DUST state. The adapter waits for a
+The overview guides the complete testnet flow: open a locally derived wallet, copy
+the address into the official Preview/Preprod faucet, register received NIGHT
+UTXOs for DUST generation, and then send an unshielded native NIGHT transfer.
+Registration and transfer recipes are signed and proven locally. Fees are selected
+from the wallet's synced DUST state. The adapter waits for a
 submitted transaction identifier to appear in Nightfrost before reporting it
 in-block.
 
@@ -71,17 +73,21 @@ Nightfrost calls used by the SDK adapter are:
 
 - `GET /api/v0/stats`
 - `GET /api/v0/ledger-parameters/latest`
-- `GET /api/v0/ledger-events?from=...&order=asc`
+- `POST /api/v0/wallet-sync/shielded` (view-only key, relevant transactions plus collapsed Merkle gaps)
+- `GET /api/v0/wallet-sync/dust?from=...&count=50000`
 - `GET /api/v0/addresses/{address}/txs?from=...&order=asc`
 - `GET /api/v0/txs/{hash}`
 - `GET /api/v0/txs/{hash}/utxos`
 - `GET /api/v0/tx-identifiers/{identifier}`
 - `POST /api/v0/tx/submit`
 
-The first sync scans the raw Zswap and Dust event feed locally, so a fresh
-wallet may take time on a long-lived test network. Poll cursors are translated
-between Nightfrost's zero-based store IDs and the SDK's one-based progress
-sentinels by the local adapter.
+The first shielded sync submits the view-only encryption key once and receives only
+relevant transactions plus authenticated collapsed Merkle updates for irrelevant
+history. The DUST core reads a separate DUST-only side index in pages of up to
+50,000 events. The key itself is not persisted by Nightfrost; the server caches
+its SHA-256 digest and relevant transaction IDs so subsequent opens of a shared
+Preview example wallet are fast. Nightfrost IDs are translated to the SDK's
+progress sentinels by the local adapter.
 
 ## Safety and scope
 
@@ -94,5 +100,7 @@ the JavaScript and WASM APIs permit it. Browser JavaScript cannot guarantee
 secure memory erasure, so do not paste a phrase that protects real funds.
 
 The **Generate test phrase** button creates a fresh 24-word BIP39 phrase with
-browser cryptographic randomness. `STAR` is the smallest NIGHT unit:
+browser cryptographic randomness. The official faucets use Cloudflare Turnstile,
+so the example opens the network faucet in a new tab and copies the receive
+address rather than attempting to proxy or bypass its anti-abuse check. `STAR` is the smallest NIGHT unit:
 `1 NIGHT = 1,000,000 STAR`.

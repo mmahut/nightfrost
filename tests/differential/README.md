@@ -102,7 +102,7 @@ Normalization helpers live in `../lib.mjs` (`normHexish`, `bech32Encode`,
 - **tx-utxos** — full input/output unshielded utxo sets (owner, token type,
   value, ctime, dust-registration flag)
 - **tx-events** — zswap + dust ledger event raw payloads per tx, id-offset
-  consistency, and the `/ledger-events` cursor feed
+  consistency, and the `/ledger/events` cursor feed
 - **contracts** — record, latest state, balances, action history sample
 - **dust** — active cNIGHT→DUST registrations per stake key, list vs per-key
   endpoint
@@ -110,5 +110,5 @@ Normalization helpers live in `../lib.mjs` (`normHexish`, `bech32Encode`,
 
 Oracle surfaces with no nightfrost counterpart (SPO/staking suite, bridge
 queries, wallet-sync merkle updates, governance history) and nightfrost extras
-with no oracle counterpart (balance/unspent queries, `/stats`, `/sync-status`,
-tx submission) are out of differential scope; see `docs/PARITY.md`.
+with no oracle counterpart (balance/unspent queries, `/stats`, `/sync`,
+tx submission) are out of differential scope.

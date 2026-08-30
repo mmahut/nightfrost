@@ -3,7 +3,7 @@
 // (sampled blocks + address histories). Event ids differ by a constant
 // offset between the two systems, so events are compared as multisets of
 // raw payload bytes per grouping; the id offset is checked for consistency.
-// Also verifies the global /ledger-events cursor feed serves the same raws.
+// Also verifies the global /ledger/events cursor feed serves the same raws.
 
 export const name = 'tx-events';
 
@@ -40,7 +40,7 @@ export async function run(ctx, t) {
       const feed = [];
       let cursor;
       for (;;) {
-        const page = await ctx.nfPage('/ledger-events', { from, count: 100, cursor });
+        const page = await ctx.nfPage('/ledger/events', { from, count: 100, cursor });
         feed.push(...page.results);
         if (page.next_cursor == null || page.results.at(-1)?.id >= through) break;
         cursor = page.next_cursor;

@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        project: [explorer, light-wallet]
+        project: [explorer, light-wallet, faucet]
     defaults:
       run:
         working-directory: examples/${{ matrix.project }}
@@ -50,6 +50,12 @@ jobs:
           cache: npm
           cache-dependency-path: examples/${{ matrix.project }}/package-lock.json
       - run: npm ci
+      # The faucet imports light-wallet sources, whose own imports TypeScript
+      # resolves against light-wallet's node_modules.
+      - name: Install light-wallet dependencies
+        if: matrix.project == 'faucet'
+        run: npm ci
+        working-directory: examples/light-wallet
       - name: Type check
         run: npx tsc --noEmit
       - name: Build

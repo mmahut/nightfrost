@@ -1,13 +1,13 @@
 // Tip sanity: nightfrost's latest block versus the oracle's, with tolerance
 // for the chain advancing between the two calls (6s slots). Also sanity-checks
-// /stats and /sync-status shapes (no oracle equivalents — informational).
+// /stats and /sync shapes (no oracle equivalents — informational).
 
 export const name = 'tip';
 
 export async function run(ctx, t) {
   const [nfLatest, sync, stats] = await Promise.all([
     ctx.nf('/blocks/latest'),
-    ctx.nf('/sync-status'),
+    ctx.nf('/sync'),
     ctx.nf('/stats'),
   ]);
   const or = await ctx.gql('{ block { height hash } }');

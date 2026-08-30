@@ -190,7 +190,7 @@ async function reqEnvelope<T>(path: string, params?: Record<string, string | num
 
   // The current API uses the { results, tip, next_cursor } envelope. The
   // binary currently deployed from the dev host predates that change and
-  // returns direct objects/arrays (ledger-events uses an `events` field), so
+  // returns direct objects/arrays (ledger events uses an `events` field), so
   // accept both while the indexers are migrated.
   if (isRecord(body) && 'results' in body) {
     return body as unknown as ApiEnvelope<T>;
@@ -216,7 +216,7 @@ async function req<T>(path: string, params?: Record<string, string | number | un
 const pageParams = (o: PageOpts = {}) => ({ count: o.count, cursor: o.cursor, order: o.order });
 
 export const api = {
-  syncStatus: () => req<SyncStatus>('/sync-status'),
+  syncStatus: () => req<SyncStatus>('/sync'),
   network: () => req<NetworkInfo>('/network'),
   stats: () => req<Stats>('/stats'),
 
@@ -239,7 +239,7 @@ export const api = {
     reqEnvelope<ContractAction[]>(`/contracts/${addr}/actions`, pageParams(opts)),
 
   ledgerEvents: (opts: EventPageOpts = {}) =>
-    reqEnvelope<ChainEvent[]>('/ledger-events', { ...pageParams(opts), from: opts.from }),
+    reqEnvelope<ChainEvent[]>('/ledger/events', { ...pageParams(opts), from: opts.from }),
 
   dustRegistrations: (stakeKey?: string, opts?: PageOpts) =>
     reqEnvelope<DustRegistration[]>(`/dust/registrations${stakeKey ? `/${stakeKey}` : ''}`, pageParams(opts)),

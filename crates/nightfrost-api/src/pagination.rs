@@ -14,7 +14,7 @@ const MAX_CURSOR_LEN: usize = 1_024;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Cursor pagination: `?count=1..100&order=asc|desc&cursor=nf1...`.
+/// Cursor pagination: `?count=1..5000&order=asc|desc&cursor=nf1...`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Pagination {
@@ -46,9 +46,9 @@ impl Default for Pagination {
 
 impl Pagination {
     pub fn validate(&self) -> Result<(), ApiError> {
-        if !(1..=100).contains(&self.count) {
+        if !(1..=5_000).contains(&self.count) {
             return Err(ApiError::bad_request(
-                "querystring count should be within range 1-100",
+                "querystring count should be within range 1-5000",
             ));
         }
         if self.page.is_some() {

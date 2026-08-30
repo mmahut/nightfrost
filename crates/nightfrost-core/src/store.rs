@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::Path;
 
 /// Highest finalized block height seen on the node, shared between the chain
-/// pipeline (writer) and the REST API (reader, for /sync-status).
+/// pipeline (writer) and the REST API (reader, for /sync).
 pub type NodeTipHeight = std::sync::Arc<std::sync::RwLock<Option<u64>>>;
 
 /// All fjall partitions, opened once at startup.
@@ -44,6 +44,17 @@ pub struct Store {
     pub contract_states: PartitionHandle,
     pub contracts: PartitionHandle,
     pub ledger_events: PartitionHandle,
+    /// Global event-id side index containing only DUST events. This lets a
+    /// wallet replay DUST without scanning every Zswap and contract event.
+    pub wallet_dust_events: PartitionHandle,
+    /// Per-transaction wallet tree positions, kept as a sidecar so adding the
+    /// wallet API does not invalidate the postcard encoding of `TxRecord`.
+    pub wallet_tx_indices: PartitionHandle,
+    /// Viewing-key hash + tx-id entries for transactions whose Zswap outputs
+    /// are decryptable by that key. The viewing key itself is never stored.
+    pub wallet_relevant_txs: PartitionHandle,
+    /// Viewing-key hash -> exclusive transaction id scanned for relevance.
+    pub wallet_scan_progress: PartitionHandle,
     pub events_by_contract: PartitionHandle,
     pub dust_generation: PartitionHandle,
     pub dust_gen_by_owner: PartitionHandle,
@@ -63,6 +74,8 @@ pub mod meta_keys {
     pub const NEXT_ACTION_ID: &str = "next_action_id";
     pub const NEXT_EVENT_ID: &str = "next_event_id";
     pub const LEDGER_STATE_WINDOW: &str = "ledger_state_window";
+    pub const WALLET_TX_INDEXED_THROUGH: &str = "wallet_tx_indexed_through";
+    pub const WALLET_DUST_INDEXED_THROUGH: &str = "wallet_dust_indexed_through";
 }
 
 /// Rolling window of persisted ledger-state keys (oldest first), stored in
@@ -169,6 +182,14 @@ pub struct EventRecord {
     pub event: LedgerEvent,
     pub tx_id: u64,
     pub block_height: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletTxIndexRecord {
+    pub zswap_start_index: u64,
+    /// Exclusive first-free index after this transaction.
+    pub zswap_end_index: u64,
+    pub protocol_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +304,10 @@ impl Store {
             contract_actions_by_addr: part("contract_actions_by_addr")?,
             contracts: part("contracts")?,
             ledger_events: part("ledger_events")?,
+            wallet_dust_events: part("wallet_dust_events")?,
+            wallet_tx_indices: part("wallet_tx_indices")?,
+            wallet_relevant_txs: part("wallet_relevant_txs")?,
+            wallet_scan_progress: part("wallet_scan_progress")?,
             events_by_contract: part("events_by_contract")?,
             dust_generation: part("dust_generation")?,
             dust_gen_by_owner: part("dust_gen_by_owner")?,
@@ -313,7 +338,7 @@ impl Store {
     }
 
     /// Every partition, for whole-store maintenance sweeps.
-    pub fn partitions(&self) -> [&PartitionHandle; 21] {
+    pub fn partitions(&self) -> [&PartitionHandle; 25] {
         [
             &self.meta,
             &self.blocks,
@@ -330,6 +355,10 @@ impl Store {
             &self.contract_states,
             &self.contracts,
             &self.ledger_events,
+            &self.wallet_dust_events,
+            &self.wallet_tx_indices,
+            &self.wallet_relevant_txs,
+            &self.wallet_scan_progress,
             &self.events_by_contract,
             &self.dust_generation,
             &self.dust_gen_by_owner,

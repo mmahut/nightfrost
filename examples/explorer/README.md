@@ -41,13 +41,13 @@ Every read endpoint of the nightfrost API (`/api/v0`), integrated end to end:
   views use opaque cursor pagination and retain visited cursors client-side for
   previous-page navigation; no numeric offsets are generated.
 
-- **Dashboard** — `/sync-status` (animated sync progress), `/network`, and
+- **Dashboard** — `/sync` (animated sync progress), `/network`, and
   `/stats` stat tiles (transactions, contracts), plus a NIGHT price/market-cap
   tile from CoinGecko (cached 60 s; the page degrades gracefully without it)
   and an epoch tile computed from the latest block timestamp (Cardano preview
   schedule: 86,400 s epochs — constants in `src/epoch.ts`). Below: live
   latest-blocks and latest-transactions tables (polling every 6 s, the
-  chain's block time) and a recent `/ledger-events` ticker. The events feed
+  chain's block time) and a recent `/ledger/events` ticker. The events feed
   is a forward cursor, so the tail is located with a binary search over
   `from`; recent tx-bearing blocks are discovered through those events.
 - **Block pages** — `/blocks/{hash|height}` with prev/next navigation,

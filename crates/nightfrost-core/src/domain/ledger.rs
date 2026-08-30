@@ -80,6 +80,9 @@ pub enum Error {
     #[error(transparent)]
     ByteArrayLen(ByteArrayLenError),
 
+    #[error("invalid Merkle tree collapsed update")]
+    InvalidUpdate(#[source] BoxError),
+
     #[error("malformed transaction")]
     MalformedTransaction(#[source] BoxError),
 

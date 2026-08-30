@@ -84,7 +84,7 @@ export async function run(ctx, t) {
     t.eq(addr, 'event count', nfEvents.length, orEvents.length);
     if (!nfEvents.length && !orEvents.length) continue;
 
-    // Ids differ by a constant offset between the systems (like /ledger-events),
+    // Ids differ by a constant offset between the systems (like /ledger/events),
     // so events are matched as multisets of raw payload bytes.
     const rawsNf = nfEvents.map((e) => e.raw.toLowerCase()).sort();
     const rawsOr = orEvents.map((e) => e.raw.toLowerCase()).sort();

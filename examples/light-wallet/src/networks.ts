@@ -2,6 +2,7 @@ export interface NetworkDef {
   name: 'Preview' | 'Preprod' | 'Mainnet';
   networkId: 'preview' | 'preprod' | 'mainnet';
   apiUrl: string;
+  faucetUrl: string | null;
   color: string;
   enabled: boolean;
 }
@@ -11,20 +12,23 @@ const DEFAULT_NETWORKS: NetworkDef[] = [
     name: 'Preview',
     networkId: 'preview',
     apiUrl: 'https://preview.nightfrost.dev',
+    faucetUrl: 'https://midnight-tmnight-preview.nethermind.dev',
     color: '#f0b429',
     enabled: true,
   },
   {
     name: 'Preprod',
     networkId: 'preprod',
-    apiUrl: 'http://127.0.0.1:3101',
+    apiUrl: 'https://preprod.nightfrost.dev',
+    faucetUrl: 'https://midnight-tmnight-preprod.nethermind.dev',
     color: '#8fd0e4',
     enabled: true,
   },
   {
     name: 'Mainnet',
     networkId: 'mainnet',
-    apiUrl: 'http://127.0.0.1:3102',
+    apiUrl: 'https://mainnet.nightfrost.dev',
+    faucetUrl: null,
     color: '#34d399',
     enabled: false,
   },
@@ -48,7 +52,10 @@ function configuredNetworks(): NetworkDef[] {
 
       return {
         ...fallback,
-        apiUrl: typeof configured?.apiUrl === 'string' ? configured.apiUrl.replace(/\/+$/, '') : fallback.apiUrl,
+        apiUrl:
+          typeof configured?.apiUrl === 'string'
+            ? configured.apiUrl.replace(/\/+$/, '')
+            : fallback.apiUrl,
         color: typeof configured?.color === 'string' ? configured.color : fallback.color,
       };
     });
@@ -61,4 +68,6 @@ function configuredNetworks(): NetworkDef[] {
 export const NETWORKS = configuredNetworks();
 
 /** The Nightfrost explorer used by transaction links. */
-export const EXPLORER_URL = (import.meta.env.VITE_EXPLORER_URL || 'https://explorer.nightfrost.dev').replace(/\/+$/, '');
+export const EXPLORER_URL = (
+  import.meta.env.VITE_EXPLORER_URL || 'https://explorer.nightfrost.dev'
+).replace(/\/+$/, '');

@@ -7,8 +7,11 @@
 
 use anyhow::Context;
 use nightfrost_core::{
-    domain::{LedgerEventGrouping, correlate_contract_action_id},
-    store::{self, ContractActionRecord, EventRecord, Store, prefixed_u64_key},
+    domain::{LedgerEventAttributes, LedgerEventGrouping, correlate_contract_action_id},
+    store::{
+        self, ContractActionRecord, EventRecord, Store, WalletTxIndexRecord, meta_keys,
+        prefixed_u64_key,
+    },
 };
 use std::collections::HashMap;
 
@@ -107,6 +110,122 @@ pub fn backfill_contract_events(store: &Store) -> anyhow::Result<BackfillCounts>
         .keyspace
         .persist(fjall::PersistMode::SyncAll)
         .context("persist keyspace")?;
+    Ok(counts)
+}
+
+#[derive(Debug, Default)]
+pub struct WalletSidecarCounts {
+    pub transactions_indexed: u64,
+    pub dust_events_indexed: u64,
+}
+
+/// Populate wallet-only side indexes for databases created before fast sync.
+/// Idempotent and safe to run at every startup before the pipeline begins.
+pub fn backfill_wallet_sidecars(
+    store: &Store,
+    current_zswap_end: u64,
+) -> anyhow::Result<WalletSidecarCounts> {
+    let target_tx = store.next_id(meta_keys::NEXT_TX_ID)?;
+    let target_event = store.next_id(meta_keys::NEXT_EVENT_ID)?;
+    let tx_progress = store.next_id(meta_keys::WALLET_TX_INDEXED_THROUGH)?;
+    let event_progress = store.next_id(meta_keys::WALLET_DUST_INDEXED_THROUGH)?;
+    let mut counts = WalletSidecarCounts::default();
+
+    let mut zswap_index = if tx_progress == 0 {
+        let outputs = store.ledger_events.iter().try_fold(0u64, |count, entry| {
+            let (_, value) = entry.context("scan events for Zswap output count")?;
+            let record: EventRecord = store::decode(&value);
+            Ok::<_, anyhow::Error>(
+                count
+                    + u64::from(matches!(
+                        record.event.attributes,
+                        LedgerEventAttributes::ZswapOutput
+                    )),
+            )
+        })?;
+        current_zswap_end
+            .checked_sub(outputs)
+            .context("stored Zswap events exceed the current first-free index")?
+    } else {
+        store
+            .wallet_tx_indices
+            .get((tx_progress - 1).to_be_bytes())?
+            .map(|value| store::decode::<WalletTxIndexRecord>(&value).zswap_end_index)
+            .context("wallet transaction index progress has no preceding record")?
+    };
+
+    let mut batch = store.batch();
+    let mut pending = 0usize;
+    for tx_id in tx_progress..target_tx {
+        let tx = store
+            .tx(tx_id)?
+            .with_context(|| format!("missing transaction {tx_id}"))?;
+        let block = store
+            .block(tx.block_height)?
+            .with_context(|| format!("missing block {}", tx.block_height))?;
+        let start = zswap_index;
+        for event_id in tx.first_event_id..tx.first_event_id + u64::from(tx.event_count) {
+            let event: EventRecord = store
+                .ledger_events
+                .get(event_id.to_be_bytes())?
+                .map(|value| store::decode(&value))
+                .with_context(|| format!("missing event {event_id}"))?;
+            if matches!(event.event.attributes, LedgerEventAttributes::ZswapOutput) {
+                zswap_index += 1;
+            }
+        }
+        batch.insert(
+            &store.wallet_tx_indices,
+            tx_id.to_be_bytes(),
+            store::encode(&WalletTxIndexRecord {
+                zswap_start_index: start,
+                zswap_end_index: zswap_index,
+                protocol_version: block.protocol_version,
+            }),
+        );
+        batch.insert(
+            &store.meta,
+            meta_keys::WALLET_TX_INDEXED_THROUGH,
+            (tx_id + 1).to_be_bytes(),
+        );
+        counts.transactions_indexed += 1;
+        pending += 1;
+        if pending >= COMMIT_EVERY {
+            batch
+                .commit()
+                .context("commit wallet transaction indexes")?;
+            batch = store.batch();
+            pending = 0;
+        }
+    }
+    anyhow::ensure!(
+        zswap_index == current_zswap_end,
+        "wallet Zswap index ended at {zswap_index}, ledger state is at {current_zswap_end}"
+    );
+
+    for event_id in event_progress..target_event {
+        let record: EventRecord = store
+            .ledger_events
+            .get(event_id.to_be_bytes())?
+            .map(|value| store::decode(&value))
+            .with_context(|| format!("missing event {event_id}"))?;
+        if matches!(record.event.grouping, LedgerEventGrouping::Dust) {
+            batch.insert(&store.wallet_dust_events, event_id.to_be_bytes(), []);
+            counts.dust_events_indexed += 1;
+        }
+        batch.insert(
+            &store.meta,
+            meta_keys::WALLET_DUST_INDEXED_THROUGH,
+            (event_id + 1).to_be_bytes(),
+        );
+        pending += 1;
+        if pending >= COMMIT_EVERY {
+            batch.commit().context("commit wallet DUST index")?;
+            batch = store.batch();
+            pending = 0;
+        }
+    }
+    batch.commit().context("commit final wallet side indexes")?;
     Ok(counts)
 }
 
@@ -274,7 +393,7 @@ pub struct DustBackfillCounts {
 /// contract-action record into `contract_actions_v2` with a content hash,
 /// stores each distinct state blob once in `contract_states`, flips the
 /// schema version only after everything is persisted, then reclaims the
-/// legacy partition as a separately retryable phase (docs/CONTRACT_STATE.md).
+/// legacy partition as a separately retryable phase.
 /// Resumable: progress is cursored in meta, and a rerun after cutover goes
 /// straight to reclamation.
 pub fn backfill_contract_states(store: &Store) -> anyhow::Result<ContractStatesCounts> {

@@ -34,7 +34,7 @@ import { Buffer } from 'buffer';
 import {
   ApiError,
   NightfrostApi,
-  type LedgerEvent,
+  type ShieldedSyncUpdate as ApiShieldedSyncUpdate,
   type Tx,
   type TxStatus,
   type Utxo,
@@ -43,9 +43,72 @@ import type { NetworkDef } from './networks.ts';
 
 const POLL_INTERVAL_MS = 2_000;
 const SUBMISSION_TIMEOUT_MS = 180_000;
+const PROVING_MATERIAL_ROOT =
+  typeof window === 'undefined'
+    ? 'https://midnight-s3-fileshare-dev-eu-west-1.s3.eu-west-1.amazonaws.com'
+    : '/proving-material';
+
+function makeProvingKeyMaterialProvider() {
+  const cache = new Map<string, Promise<Uint8Array>>();
+  const material = (path: string): Promise<Uint8Array> => {
+    const existing = cache.get(path);
+    if (existing) return existing;
+    console.info('[nf-material] fetch', path);
+    // Without a deadline a stalled connection leaves the prover waiting
+    // silently at 0% CPU until the SDK's own timeout kills the whole proof;
+    // a named failure here is retryable and diagnosable.
+    const request = fetch(PROVING_MATERIAL_ROOT + '/' + path, {
+      signal: AbortSignal.timeout(120_000),
+    }).then(async (response) => {
+      if (!response.ok) {
+        throw new Error(
+          'Could not load Midnight proving material ' + path + ' (HTTP ' + response.status + ').',
+        );
+      }
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      console.info('[nf-material] done', path, bytes.length, 'bytes');
+      return bytes;
+    });
+    cache.set(path, request);
+    request.catch(() => cache.delete(path));
+    return request;
+  };
+
+  return {
+    async lookupKey(keyLocation: string) {
+      const path = {
+        'midnight/zswap/spend': 'zswap/9/spend',
+        'midnight/zswap/output': 'zswap/9/output',
+        'midnight/zswap/sign': 'zswap/9/sign',
+        'midnight/dust/spend': 'dust/9/spend',
+      }[keyLocation];
+      if (!path) return undefined;
+      const [proverKey, verifierKey, ir] = await Promise.all([
+        material(path + '.prover'),
+        material(path + '.verifier'),
+        material(path + '.bzkir'),
+      ]);
+      return { proverKey, verifierKey, ir };
+    },
+    getParams(k: number) {
+      return material('bls_midnight_2p' + k);
+    },
+  };
+}
+
+
+export type SyncCore = 'shielded' | 'unshielded' | 'dust';
+
+export interface SyncProgress {
+  core: SyncCore;
+  scanned: number;
+  total: number;
+}
 
 type NightfrostConfiguration = DefaultConfiguration & {
   api: NightfrostApi;
+  viewingKey: string;
+  onProgress?: (progress: SyncProgress) => void;
   pollIntervalMs: number;
 };
 
@@ -74,11 +137,7 @@ type UnshieldedProgressUpdate = {
 type UnshieldedUpdate = UnshieldedTransactionUpdate | UnshieldedProgressUpdate;
 
 type ShieldedUpdate = {
-  events: readonly {
-    id: number;
-    protocolVersion: number;
-    event: ledger.Event;
-  }[];
+  updates: readonly ApiShieldedSyncUpdate[];
   secretKeys: ledger.ZswapSecretKeys;
   appliedThrough: number;
   highestId: number;
@@ -99,18 +158,45 @@ type DustUpdate = {
 
 export interface SendResult {
   identifier: string;
+  /** Indexed transaction hash; absent when the post-submit lookup failed. */
+  hash?: string;
 }
+
+export interface DustStatus {
+  balance: bigint;
+  registeredUtxos: number;
+  unregisteredUtxos: number;
+}
+
+export type TransactionStageReporter = (message: string) => void;
 
 export interface LocalWalletSession {
   readonly wallet: WalletFacade;
   readonly addressHex: string;
   readonly address: string;
   readonly state: ReturnType<WalletFacade['state']>;
-  sendUnshielded(receiver: string, amount: bigint): Promise<SendResult>;
+  readonly dustAddress: string;
+  readonly ready: Promise<void>;
+  dustStatus(): Promise<DustStatus>;
+  registerForDustGeneration(onStage?: TransactionStageReporter): Promise<SendResult>;
+  sendUnshielded(
+    receiver: string,
+    amount: bigint,
+    onStage?: TransactionStageReporter,
+  ): Promise<SendResult>;
+  /**
+   * Restart the wallet cores' background sync with the key material already
+   * held by this tab. Resolves once every core reports a synced state again.
+   */
+  resync(): Promise<void>;
   stop(): Promise<void>;
 }
 
-function pollingStream<A>(poll: () => Promise<readonly A[]>, intervalMs: number): Stream.Stream<A> {
+function pollingStream<A>(
+  poll: () => Promise<readonly A[]>,
+  intervalMs: number,
+  shouldPause: (items: readonly A[]) => boolean = () => true,
+): Stream.Stream<A> {
   return Stream.async<A>((emit) => {
     let active = true;
     let synchronized = false;
@@ -125,12 +211,15 @@ function pollingStream<A>(poll: () => Promise<readonly A[]>, intervalMs: number)
 
     void (async () => {
       while (active) {
+        let pause = true;
         try {
-          for (const item of await poll()) {
+          const items = await poll();
+          for (const item of items) {
             if (!active) return;
             await emit.single(item);
           }
           synchronized = true;
+          pause = shouldPause(items);
         } catch (error) {
           if (!synchronized) {
             await emit.die(error);
@@ -138,7 +227,7 @@ function pollingStream<A>(poll: () => Promise<readonly A[]>, intervalMs: number)
           }
           console.warn('Nightfrost wallet sync retrying after an API error', error);
         }
-        if (active) await sleep();
+        if (active && pause) await sleep();
       }
     })();
 
@@ -182,7 +271,10 @@ function walletUtxo(utxo: Utxo, fallbackTime: number): UnshieldedV1.UnshieldedSt
   });
 }
 
-async function unshieldedTransaction(api: NightfrostApi, hash: string): Promise<UnshieldedTransactionUpdate> {
+async function unshieldedTransaction(
+  api: NightfrostApi,
+  hash: string,
+): Promise<UnshieldedTransactionUpdate> {
   const [tx, utxos] = await Promise.all([api.tx(hash), api.txUtxos(hash)]);
   return {
     kind: 'transaction',
@@ -212,7 +304,11 @@ function makeUnshieldedSync(config: NightfrostConfiguration) {
         const hashes: string[] = [];
 
         do {
-          const page = await config.api.addressTxsSince(state.publicKey.addressHex, appliedId, cursor);
+          const page = await config.api.addressTxsSince(
+            state.publicKey.addressHex,
+            appliedId,
+            cursor,
+          );
           hashes.push(...page.results);
           cursor = page.next_cursor ?? undefined;
         } while (cursor !== undefined);
@@ -225,11 +321,10 @@ function makeUnshieldedSync(config: NightfrostConfiguration) {
 
         appliedId = Math.max(
           highestId,
-          ...updates
-            .filter((update) => update.kind === 'transaction')
-            .map((update) => update.id),
+          ...updates.filter((update) => update.kind === 'transaction').map((update) => update.id),
           appliedId,
         );
+        config.onProgress?.({ core: 'unshielded', scanned: appliedId, total: highestId });
         updates.push({ kind: 'progress', appliedId, highestId: appliedId });
         return updates;
       }, config.pollIntervalMs);
@@ -269,30 +364,6 @@ function makeUnshieldedCapability() {
   };
 }
 
-async function allLedgerEvents(api: NightfrostApi, from: number): Promise<{
-  events: LedgerEvent[];
-  highestId: number;
-  protocolVersion: number;
-  timestamp: Date;
-}> {
-  const [stats, blockData] = await Promise.all([api.stats(), api.ledgerParameters()]);
-  let cursor: string | undefined;
-  const events: LedgerEvent[] = [];
-
-  do {
-    const page = await api.ledgerEvents(from, cursor);
-    events.push(...page.results);
-    cursor = page.next_cursor ?? undefined;
-  } while (cursor !== undefined);
-
-  return {
-    events,
-    highestId: Math.max(stats.total_ledger_events, ...events.map((event) => sdkIndex(event.id))),
-    protocolVersion: events.at(-1)?.protocol_version ?? blockData.protocol_version,
-    timestamp: new Date(blockData.block_time),
-  };
-}
-
 function makeShieldedSync(config: NightfrostConfiguration) {
   return {
     updates(
@@ -300,25 +371,34 @@ function makeShieldedSync(config: NightfrostConfiguration) {
       secretKeys: ledger.ZswapSecretKeys,
     ): Stream.Stream<ShieldedUpdate> {
       let appliedThrough = Number(state.progress.appliedIndex);
-      return pollingStream(async () => {
-        const batch = await allLedgerEvents(config.api, appliedThrough);
-        appliedThrough = batch.highestId;
-        return [
-          {
-            events: batch.events
-              .filter((event) => event.grouping === 'Zswap')
-              .map((event) => ({
-                id: sdkIndex(event.id),
-                protocolVersion: event.protocol_version,
-                event: ledger.Event.deserialize(hexBytes(event.raw)),
-              })),
-            secretKeys,
-            appliedThrough,
-            highestId: batch.highestId,
-            protocolVersion: batch.protocolVersion,
-          },
-        ];
-      }, config.pollIntervalMs);
+      let protocolVersion = Number(state.protocolVersion);
+      return pollingStream(
+        async () => {
+          const response = await config.api.walletShieldedSync(config.viewingKey, appliedThrough);
+          const result = response.results;
+          appliedThrough = result.applied_through;
+          protocolVersion = result.updates.at(-1)?.protocol_version ?? protocolVersion;
+          config.onProgress?.({
+            core: 'shielded',
+            scanned: appliedThrough,
+            total: result.highest_index,
+          });
+          return [
+            {
+              updates: result.updates,
+              secretKeys,
+              appliedThrough,
+              highestId: result.highest_index,
+              protocolVersion,
+            },
+          ];
+        },
+        config.pollIntervalMs,
+        (updates) => {
+          const latest = updates.at(-1);
+          return latest === undefined || latest.appliedThrough >= latest.highestId;
+        },
+      );
     },
   };
 }
@@ -329,25 +409,39 @@ function makeShieldedCapability() {
       state: ShieldedV1.CoreWallet,
       update: ShieldedUpdate,
     ): [ShieldedV1.CoreWallet, ShieldedV1.Sync.ChangesResult] {
-      const fresh = update.events.filter((event) => BigInt(event.id) > state.progress.appliedIndex);
-      const [wallet, changes] =
-        fresh.length === 0
-          ? [state, [] as ledger.ZswapStateChanges[]]
-          : ShieldedV1.CoreWallet.replayEventsWithChanges(
-              state,
-              update.secretKeys,
-              fresh.map((event) => event.event),
-            );
+      let wallet = state;
+      const changes: ledger.ZswapStateChanges[] = [];
+      let protocolVersion = update.protocolVersion;
+
+      for (const item of update.updates) {
+        if (item.to_index <= Number(wallet.progress.appliedIndex)) continue;
+        protocolVersion = item.protocol_version;
+        if (item.type === 'collapsed') {
+          wallet = ShieldedV1.CoreWallet.applyCollapsedUpdate(
+            wallet,
+            ledger.MerkleTreeCollapsedUpdate.deserialize(hexBytes(item.update)),
+          );
+          continue;
+        }
+        const [next, itemChanges] = ShieldedV1.CoreWallet.replayEventsWithChanges(
+          wallet,
+          update.secretKeys,
+          item.events.map((event) => ledger.Event.deserialize(hexBytes(event.raw))),
+        );
+        wallet = next;
+        changes.push(...itemChanges);
+      }
+
+      const highest = BigInt(update.highestId);
       return [
         ShieldedV1.CoreWallet.updateProgress(wallet, {
           appliedIndex: BigInt(update.appliedThrough),
-          highestRelevantWalletIndex: BigInt(update.highestId),
+          highestRelevantWalletIndex: highest,
+          highestIndex: highest,
+          highestRelevantIndex: highest,
           isConnected: true,
         }),
-        {
-          changes,
-          protocolVersion: fresh.at(-1)?.protocolVersion ?? update.protocolVersion,
-        },
+        { changes, protocolVersion },
       ];
     },
   };
@@ -357,25 +451,39 @@ function makeDustSync(config: NightfrostConfiguration) {
   return {
     updates(state: DustV1.CoreWallet, secretKey: ledger.DustSecretKey): Stream.Stream<DustUpdate> {
       let appliedThrough = Number(state.progress.appliedIndex);
-      return pollingStream(async () => {
-        const batch = await allLedgerEvents(config.api, appliedThrough);
-        appliedThrough = batch.highestId;
-        return [
-          {
-            events: batch.events
-              .filter((event) => event.grouping === 'Dust')
-              .map((event) => ({
+      return pollingStream(
+        async () => {
+          const [response, blockData] = await Promise.all([
+            config.api.walletDustSync(appliedThrough),
+            config.api.ledgerParameters(),
+          ]);
+          appliedThrough = response.results.scanned_through;
+          config.onProgress?.({
+            core: 'dust',
+            scanned: appliedThrough,
+            total: response.results.highest_event_id,
+          });
+          return [
+            {
+              events: response.results.events.map((event) => ({
                 id: sdkIndex(event.id),
                 event: ledger.Event.deserialize(hexBytes(event.raw)),
               })),
-            secretKey,
-            appliedThrough,
-            highestId: batch.highestId,
-            protocolVersion: batch.protocolVersion,
-            timestamp: batch.timestamp,
-          },
-        ];
-      }, config.pollIntervalMs);
+              secretKey,
+              appliedThrough,
+              highestId: response.results.highest_event_id,
+              protocolVersion:
+                response.results.events.at(-1)?.protocol_version ?? blockData.protocol_version,
+              timestamp: new Date(blockData.block_time),
+            },
+          ];
+        },
+        config.pollIntervalMs,
+        (updates) => {
+          const latest = updates.at(-1);
+          return latest === undefined || latest.appliedThrough >= latest.highestId;
+        },
+      );
     },
     blockData() {
       return Effect.tryPromise({
@@ -414,10 +522,13 @@ function makeDustCapability() {
               fresh.map((event) => event.event),
               update.timestamp,
             );
+      const highest = BigInt(update.highestId);
       return [
         DustV1.CoreWallet.updateProgress(wallet, {
           appliedIndex: BigInt(update.appliedThrough),
-          highestRelevantWalletIndex: BigInt(update.highestId),
+          highestRelevantWalletIndex: highest,
+          highestIndex: highest,
+          highestRelevantIndex: highest,
           isConnected: true,
         }),
         { changes, protocolVersion: update.protocolVersion },
@@ -540,8 +651,20 @@ function waitForIndexedTransaction(
         const tx = await api.txByIdentifier(identifier);
         resolve(tx);
       } catch (error) {
-        if (error instanceof ApiError && error.status === 404 && Date.now() < deadline) {
+        const retryable =
+          error instanceof ApiError &&
+          (error.status === 0 || error.status === 404 || error.status === 429 || error.status >= 500);
+        if (retryable && Date.now() < deadline) {
           setTimeout(() => void check(), POLL_INTERVAL_MS);
+          return;
+        }
+        if (retryable) {
+          reject(
+            new Error(
+              'Transaction was submitted, but Nightfrost confirmation timed out. Check the wallet history before retrying.',
+              { cause: error },
+            ),
+          );
           return;
         }
         reject(error);
@@ -582,7 +705,8 @@ function makeSubmissionService(
   };
 
   return {
-    submitTransaction: submit as SubmissionService<ledger.FinalizedTransaction>['submitTransaction'],
+    submitTransaction:
+      submit as SubmissionService<ledger.FinalizedTransaction>['submitTransaction'],
     close: async () => undefined,
   };
 }
@@ -640,6 +764,7 @@ function parseRecipient(input: string, networkId: string): UnshieldedAddress {
 export async function openNightfrostWallet(
   words: string,
   network: NetworkDef,
+  onProgress?: (progress: SyncProgress) => void,
 ): Promise<LocalWalletSession> {
   const mnemonic = words.trim().toLowerCase().replace(/\s+/g, ' ');
   if (!validateMnemonic(mnemonic)) {
@@ -647,11 +772,15 @@ export async function openNightfrostWallet(
   }
 
   const api = new NightfrostApi(network);
-  const [blockData] = await Promise.all([
-    api.ledgerParameters(),
-    api.stats(),
-    api.ledgerEvents(0),
-  ]);
+  // Submission already waited for the transaction to be indexed, so the hash
+  // is resolvable immediately; treat a failed lookup as cosmetic (the UI
+  // falls back to showing the identifier).
+  const lookupTxHash = (identifier: string): Promise<string | undefined> =>
+    api
+      .txByIdentifier(identifier)
+      .then((tx) => tx.hash)
+      .catch(() => undefined);
+  const blockData = await api.ledgerParameters();
   const ledgerParameters = ledger.LedgerParameters.deserialize(
     hexBytes(blockData.ledger_parameters),
   );
@@ -676,10 +805,19 @@ export async function openNightfrostWallet(
   const unshieldedSeed = derived.keys[Roles.NightExternal];
   const shieldedKeys = ledger.ZswapSecretKeys.fromSeed(derived.keys[Roles.Zswap]);
   const dustKey = ledger.DustSecretKey.fromSeed(derived.keys[Roles.Dust]);
+  const encryptionKey = shieldedKeys.encryptionSecretKey;
+  const viewingKeyBytes = encryptionKey.yesIKnowTheSecurityImplicationsOfThis_serialize();
+  const viewingKey = Buffer.from(viewingKeyBytes).toString('hex');
+  viewingKeyBytes.fill(0);
+  // The getter is a live handle owned by shieldedKeys; shieldedKeys.clear()
+  // clears it when the wallet session stops.
   derived.keys[Roles.Zswap].fill(0);
   derived.keys[Roles.Dust].fill(0);
   const keystore: UnshieldedKeystore = createKeystore(unshieldedSeed, network.networkId);
-  const txHistoryStorage = new InMemoryTransactionHistoryStorage(WalletEntrySchema, mergeWalletEntries);
+  const txHistoryStorage = new InMemoryTransactionHistoryStorage(
+    WalletEntrySchema,
+    mergeWalletEntries,
+  );
   const configuration: NightfrostConfiguration = {
     networkId: network.networkId,
     costParameters: { feeBlocksMargin: 5 },
@@ -687,6 +825,8 @@ export async function openNightfrostWallet(
     indexerClientConnection: { indexerHttpUrl: network.apiUrl },
     txHistoryStorage,
     api,
+    viewingKey,
+    onProgress,
     pollIntervalMs: POLL_INTERVAL_MS,
   };
   const factories = walletFactories(configuration);
@@ -699,7 +839,8 @@ export async function openNightfrostWallet(
       unshielded: () =>
         factories.UnshieldedWallet.startWithPublicKey(PublicKey.fromKeyStore(keystore)),
       dust: () => factories.DustWallet.startWithSecretKey(dustKey, ledgerParameters.dust),
-      provingService: () => makeWasmProvingService(),
+      provingService: () =>
+        makeWasmProvingService({ keyMaterialProvider: makeProvingKeyMaterialProvider() }),
       submissionService: () => makeSubmissionService(configuration),
       pendingTransactionsService: () => makePendingTransactionsService(configuration),
     });
@@ -712,7 +853,6 @@ export async function openNightfrostWallet(
 
   try {
     await wallet.start(shieldedKeys, dustKey);
-    await wallet.waitForSyncedState();
   } catch (error) {
     await wallet.stop().catch(() => undefined);
     shieldedKeys.clear();
@@ -721,12 +861,66 @@ export async function openNightfrostWallet(
     throw error;
   }
 
+  const ready = wallet.waitForSyncedState().then(() => undefined);
+  void ready.catch(() => undefined);
+
+  const dustAddress = MidnightBech32m.encode(
+    network.networkId,
+    await wallet.dust.getAddress(),
+  ).asString();
+  const availableNightUtxos = async () => {
+    const state = await wallet.unshielded.waitForSyncedState();
+    const native = ledger.unshieldedToken().raw;
+    return state.availableCoins.filter((coin) => coin.utxo.type === native);
+  };
+
   return {
     wallet,
     addressHex: keystore.getAddress(),
     address: keystore.getBech32Address().asString(),
     state: wallet.state(),
-    sendUnshielded: async (receiver, amount) => {
+    dustAddress,
+    ready,
+    dustStatus: async () => {
+      const [nightUtxos, dustState] = await Promise.all([
+        availableNightUtxos(),
+        wallet.dust.waitForSyncedState(),
+      ]);
+      return {
+        balance: dustState.balance(new Date()),
+        registeredUtxos: nightUtxos.filter((coin) => coin.meta.registeredForDustGeneration).length,
+        unregisteredUtxos: nightUtxos.filter((coin) => !coin.meta.registeredForDustGeneration)
+          .length,
+      };
+    },
+    registerForDustGeneration: async (onStage) => {
+      onStage?.('Checking available NIGHT outputs…');
+      const nightUtxos = (await availableNightUtxos()).filter(
+        (coin) => !coin.meta.registeredForDustGeneration,
+      );
+      if (nightUtxos.length === 0) {
+        throw new Error(
+          'No unregistered NIGHT UTXO is available. Fund this address and wait for wallet sync first.',
+        );
+      }
+      onStage?.('Estimating the DUST registration fee…');
+      const { fee } = await wallet.estimateRegistration(nightUtxos);
+      onStage?.('Waiting until the NIGHT output has generated ' + fee + ' DUST specks…');
+      await wallet.waitForGeneratedDust(nightUtxos, fee, { timeoutMs: 15 * 60 * 1_000 });
+      onStage?.('Building and signing the DUST registration…');
+      const recipe = await wallet.registerNightUtxosForDustGeneration(
+        nightUtxos,
+        keystore.getPublicKey(),
+        (payload) => keystore.signData(payload),
+      );
+      onStage?.('Generating the zero-knowledge proof locally…');
+      const finalized = await wallet.finalizeRecipe(recipe);
+      onStage?.('Submitting the registration and waiting for confirmation…');
+      const identifier = await wallet.submitTransaction(finalized);
+      return { identifier, hash: await lookupTxHash(identifier) };
+    },
+    sendUnshielded: async (receiver, amount, onStage) => {
+      onStage?.('Selecting NIGHT and DUST inputs…');
       if (amount <= 0n) throw new Error('Amount must be greater than zero.');
       const recipe = await wallet.transferTransaction(
         [
@@ -744,10 +938,24 @@ export async function openNightfrostWallet(
         { shieldedSecretKeys: shieldedKeys, dustSecretKey: dustKey },
         { ttl: new Date(Date.now() + 30 * 60 * 1_000), payFees: true },
       );
+      onStage?.('Signing the transaction locally…');
       const signed = await wallet.signRecipe(recipe, (payload) => keystore.signData(payload));
+      onStage?.('Generating the zero-knowledge proof locally…');
       const finalized = await wallet.finalizeRecipe(signed);
+      onStage?.('Submitting the transaction and waiting for confirmation…');
       const identifier = await wallet.submitTransaction(finalized);
-      return { identifier };
+      return { identifier, hash: await lookupTxHash(identifier) };
+    },
+    resync: async () => {
+      // Key material is still held by this tab (it's only cleared in stop()),
+      // so the cores can relaunch their background sync in place. The facade's
+      // state observables survive the restart, which keeps `ready` and every
+      // existing subscription working.
+      await wallet.stop().catch((error) => {
+        console.warn('Nightfrost resync: stopping the stuck cores failed', error);
+      });
+      await wallet.start(shieldedKeys, dustKey);
+      await wallet.waitForSyncedState();
     },
     stop: async () => {
       await wallet.stop();

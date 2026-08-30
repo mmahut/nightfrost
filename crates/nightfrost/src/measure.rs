@@ -1,5 +1,5 @@
-//! One-off maintenance: measure contract-state duplication (see
-//! docs/CONTRACT_STATE.md). Read-only over the store; run with the indexer
+//! One-off maintenance: measure contract-state duplication.
+//! Read-only over the store; run with the indexer
 //! stopped like the backfills. Decodes the schema-1 inline-state records:
 //! this measurement exists to size the migration, so it only makes sense on
 //! a legacy store.

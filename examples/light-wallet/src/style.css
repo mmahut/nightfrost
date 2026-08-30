@@ -6,6 +6,60 @@
   min-height: calc(100vh - 150px);
 }
 
+.wallet-opening {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(520px 320px at 50% 42%, var(--glow), transparent 72%),
+    color-mix(in srgb, var(--bg) 96%, transparent);
+  backdrop-filter: blur(10px);
+}
+
+.wallet-opening-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.wallet-opening-logo {
+  width: 86px;
+  height: 86px;
+  color: var(--accent);
+  filter: drop-shadow(0 0 22px var(--glow));
+  animation: wallet-opening-spin 2.4s linear infinite;
+}
+
+.wallet-opening-logo svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.wallet-opening-title {
+  font-size: 1.12rem;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.wallet-opening-copy {
+  max-width: 380px;
+  font-size: 0.86rem;
+}
+
+@keyframes wallet-opening-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wallet-opening-logo { animation: none; }
+}
+
 .wallet-product {
   padding-left: 10px;
   border-left: 1px solid var(--hairline);
@@ -129,6 +183,79 @@
   min-width: 0;
 }
 
+.wallet-sync-banner {
+  display: grid;
+  gap: 9px;
+  margin: -8px 0 16px;
+  padding: 13px 14px;
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--panel) 90%, transparent);
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.wallet-sync-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+/* The nightfrost snowflake is the sync indicator: green once synced,
+   yellow and spinning while a core is still catching up. */
+.wallet-sync-logo {
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+}
+
+.wallet-sync-logo svg {
+  width: 100%;
+  height: 100%;
+}
+
+.wallet-sync-row.is-progress .wallet-sync-logo {
+  color: #e8b84a;
+  animation: wallet-spin 1.6s linear infinite;
+}
+
+.wallet-sync-row.is-synced .wallet-sync-logo {
+  color: var(--ok);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wallet-sync-row.is-progress .wallet-sync-logo {
+    animation: wallet-sync-pulse 2s ease-in-out infinite;
+  }
+}
+
+.wallet-sync-label {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.wallet-sync-state {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.wallet-sync-row.is-synced .wallet-sync-state {
+  color: var(--ok);
+}
+
+.wallet-sync-error {
+  margin-top: 2px;
+  padding-top: 9px;
+  border-top: 1px solid var(--hairline);
+  color: var(--bad);
+  line-height: 1.45;
+}
+
+@keyframes wallet-sync-pulse {
+  50% { opacity: 0.35; transform: scale(0.75); }
+}
+
 .wallet-tabs {
   margin-bottom: 18px;
 }
@@ -165,6 +292,31 @@
 
 .wallet-txs-table .table-row {
   cursor: default;
+}
+
+/* The wallet table adds an amount column to the explorer's five-column
+   txs-table grid, so widen the floor accordingly. */
+.wallet-txs-table .table-head,
+.wallet-txs-table .table-row {
+  grid-template-columns: 64px minmax(0, 1fr) 130px 88px 120px 150px;
+  min-width: 690px;
+}
+
+.wallet-txs-table .amount-cell {
+  text-align: right;
+}
+
+.amount-in {
+  color: var(--ok);
+}
+
+.amount-out {
+  color: var(--bad);
+}
+
+.wallet-resync-btn {
+  margin-top: 10px;
+  justify-self: start;
 }
 
 .wallet-txs-table .time-cell {
@@ -307,7 +459,29 @@
   display: flex;
   align-items: center;
   gap: 7px;
-  color: var(--good);
+  color: var(--ok);
+}
+
+.setup-panel {
+  text-align: left;
+}
+
+.setup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 18px 0 12px;
+}
+
+.faucet-link {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+.setup-panel .receive-hex {
+  margin-top: 14px;
 }
 
 .mainnet-dialog {
@@ -342,9 +516,31 @@
   font-size: 1.6rem;
 }
 
-.dialog-close {
+.mainnet-confirmation-copy {
+  display: block;
+  margin: 10px 0 12px;
+  color: var(--bad);
+  font-size: 0.82rem;
+}
+
+.mainnet-confirmation {
+  margin-top: 4px;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
   margin-top: 22px;
+}
+
+.dialog-actions button {
   padding: 9px 18px;
+}
+
+.dialog-confirm:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 @media (max-width: 640px) {
@@ -393,4 +589,230 @@
     flex-direction: column;
   }
 
+}
+
+/* ------------------------------------------------ status strip (UX rework) */
+/* Balances and the sync box sit side by side above the tabs; the sync box is
+   compact and right-aligned under the Forget wallet button. */
+.wallet-status-strip {
+  display: flex;
+  align-items: stretch;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin: -6px 0 18px;
+}
+
+.wallet-status-strip .balance-cards {
+  flex: 1 1 340px;
+  margin: 0;
+  align-content: flex-start;
+}
+
+.wallet-status-strip .wallet-sync-banner {
+  flex: 0 1 280px;
+  min-width: 235px;
+  margin: 0 0 0 auto;
+  align-self: flex-start;
+  font-size: 0.78rem;
+  padding: 11px 12px;
+}
+
+.balance-dust .balance-value {
+  color: var(--accent);
+}
+
+.dust-meter {
+  position: relative;
+  height: 4px;
+  margin-top: 9px;
+  border-radius: 2px;
+  background: var(--hairline);
+  overflow: hidden;
+}
+
+.dust-meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.4s ease;
+}
+
+/* ------------------------------------------------------ onboarding steps */
+.setup-steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  margin: 16px 0 8px;
+}
+
+.setup-step {
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  padding: 15px 16px;
+  opacity: 0.55;
+  transition: opacity 0.25s ease, border-color 0.25s ease;
+}
+
+.setup-step.is-active {
+  opacity: 1;
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--hairline));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.setup-step.is-done {
+  opacity: 0.75;
+  border-color: color-mix(in srgb, var(--ok) 40%, var(--hairline));
+}
+
+.setup-step-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-weight: 650;
+  margin-bottom: 5px;
+}
+
+.setup-step-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid var(--hairline);
+  font-size: 0.72rem;
+  color: var(--muted);
+  flex: none;
+}
+
+.setup-step.is-active .setup-step-mark {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.setup-step.is-done .setup-step-mark {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.setup-step-desc {
+  font-size: 0.84rem;
+  color: var(--muted);
+  margin-bottom: 13px;
+  line-height: 1.5;
+}
+
+.setup-step-action {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+/* --------------------------------------------------- busy status + spinner */
+.spin {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: wallet-spin 0.9s linear infinite;
+  flex: none;
+  margin-top: 2px;
+}
+
+@keyframes wallet-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spin { animation-duration: 2.4s; }
+}
+
+.send-status.is-busy {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.send-proving-timer {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.send-proving-note {
+  flex-basis: 100%;
+  font-size: 0.8rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+/* Nokia-style snake shown while the proof is generated in the browser. */
+.send-snake {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 300px;
+  margin-inline: auto;
+}
+
+.send-snake-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.send-snake-lcd {
+  width: 100%;
+  border: 1px solid rgba(0, 0, 0, 0.3);
+  border-radius: 6px;
+  background: #a3b65c;
+  touch-action: none;
+}
+
+.send-snake-hint {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.send-fee-note {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.send-fee-dust {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+/* ------------------------------------------------------- syncing overlay */
+.sync-overlay-spin {
+  width: 26px;
+  height: 26px;
+  border-width: 3px;
+  margin: 0 auto 6px;
+}
+
+.sync-overlay-rows {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  text-align: left;
+}
+
+.sync-overlay-dismiss {
+  margin-top: 16px;
+}
+
+@media (max-width: 720px) {
+  .wallet-status-strip .wallet-sync-banner {
+    flex-basis: 100%;
+    margin-left: 0;
+  }
 }

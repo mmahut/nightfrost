@@ -13,8 +13,7 @@
 
 // Vendored and adapted from midnight-indexer
 // (indexer-common/src/domain/ledger/ledger_state.rs). The wallet-sync-only
-// Merkle-tree collapsed-update makers and `extract_contract_zswap_state` are
-// dropped; the ledger DB is `crate::ledger_db::FjallLedgerDb`.
+// collapsed-update makers are retained; the ledger DB is `crate::ledger_db::FjallLedgerDb`.
 
 use crate::{
     domain::{
@@ -92,8 +91,11 @@ use midnight_storage_core_v1::{
     db::DB,
     storage::default_storage,
 };
-use midnight_transient_crypto_v2::merkle_tree::{MerkleTreeDigest, TreeInsertionPath};
+use midnight_transient_crypto_v2::merkle_tree::{
+    MerkleTreeCollapsedUpdate, MerkleTreeDigest, TreeInsertionPath,
+};
 use midnight_transient_crypto_v3::merkle_tree::{
+    MerkleTreeCollapsedUpdate as MerkleTreeCollapsedUpdateV9,
     MerkleTreeDigest as MerkleTreeDigestV9, TreeInsertionPath as TreeInsertionPathV9,
 };
 use std::{
@@ -814,6 +816,34 @@ impl LedgerState {
                     .expect("zswap state Merkle tree root should exist");
                 ZswapMerkleTreeRoot::V9(root)
             }
+        }
+    }
+
+    /// Serialize a concise update for an inclusive range of the Zswap coin
+    /// commitment tree. Wallets apply this to skip irrelevant history while
+    /// retaining the Merkle root needed to spend.
+    pub fn make_zswap_collapsed_update(
+        &self,
+        start_index: u64,
+        end_index: u64,
+    ) -> Result<ByteVec, Error> {
+        match self {
+            Self::V8 { ledger_state, .. } => MerkleTreeCollapsedUpdate::new(
+                &ledger_state.zswap.coin_coms.rehash(),
+                start_index,
+                end_index,
+            )
+            .map_err(|error| Error::InvalidUpdate(error.into()))?
+            .tagged_serialize()
+            .map_err(|error| Error::Serialize("MerkleTreeCollapsedUpdate", error)),
+            Self::V9 { ledger_state, .. } => MerkleTreeCollapsedUpdateV9::new(
+                &ledger_state.zswap.coin_coms.rehash(),
+                start_index,
+                end_index,
+            )
+            .map_err(|error| Error::InvalidUpdate(error.into()))?
+            .tagged_serialize()
+            .map_err(|error| Error::Serialize("MerkleTreeCollapsedUpdate", error)),
         }
     }
 

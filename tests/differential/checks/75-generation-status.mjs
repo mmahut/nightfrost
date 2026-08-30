@@ -1,4 +1,4 @@
-// Dust generation status: nightfrost /dust/generation-status/{stake_key}
+// Dust generation status: nightfrost /dust/status/{stake_key}
 // versus the oracle's dustGenerationStatus query, over ~50 stake keys — every
 // flavor the chain offers (currently registered, deregistered, mapping-only)
 // plus synthetic never-registered keys.
@@ -55,7 +55,7 @@ export async function run(ctx, t) {
     const or = orByKey.get(k);
     if (!or) continue; // whole chunk failed above, already recorded
 
-    const nf = await ctx.nf(`/dust/generation-status/${k}`);
+    const nf = await ctx.nf(`/dust/status/${k}`);
     t.bump();
     if (nf.__status === 404) {
       t.mismatch(k, 'existence', '404', or.registered ? 'registered' : 'unregistered');
@@ -86,7 +86,7 @@ export async function run(ctx, t) {
     // the bech32 spelling of the stake key must resolve identically
     if (!bech32Checked && nf.registered) {
       bech32Checked = true;
-      const viaBech = await ctx.nf(`/dust/generation-status/${bech32Encode('stake_test', fromHex(k), 1)}`);
+      const viaBech = await ctx.nf(`/dust/status/${bech32Encode('stake_test', fromHex(k), 1)}`);
       t.bump();
       if (JSON.stringify({ ...viaBech, current_capacity: null }) !== JSON.stringify({ ...nf, current_capacity: null }))
         t.mismatch(k, 'bech32 vs hex stake key', viaBech, nf);

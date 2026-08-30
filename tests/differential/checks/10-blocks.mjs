@@ -7,7 +7,7 @@ import { ZERO32 } from '../lib.mjs';
 export const name = 'blocks';
 
 export async function run(ctx, t) {
-  const sync = await ctx.nf('/sync-status');
+  const sync = await ctx.nf('/sync');
   const H = sync.indexed_height;
   ctx.indexedHeight = H;
   process.stderr.write(`nightfrost indexed height: ${H}\n`);

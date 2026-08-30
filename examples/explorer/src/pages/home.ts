@@ -1,5 +1,5 @@
 // Dashboard: sync progress, network chip, stat tiles, live latest-blocks and
-// latest-transactions tables, recent ledger-events ticker.
+// latest-transactions tables, recent ledger events ticker.
 
 import { api, type Block, type ChainEvent, type Tx } from '../api.ts';
 import { epochAt, formatDuration } from '../epoch.ts';

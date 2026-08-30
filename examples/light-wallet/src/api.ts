@@ -58,6 +58,7 @@ export interface LedgerEvent {
   tx_id: number;
   block_height: number;
   protocol_version: number;
+  relevant?: boolean | null;
 }
 
 export interface Stats {
@@ -65,6 +66,43 @@ export interface Stats {
   total_contract_actions: number;
   total_ledger_events: number;
   total_contracts: number;
+}
+
+export interface WalletEventsResult {
+  events: LedgerEvent[];
+  scanned_through: number;
+  highest_event_id: number;
+}
+
+export type ShieldedSyncUpdate =
+  | {
+      type: 'collapsed';
+      from_index: number;
+      to_index: number;
+      protocol_version: number;
+      update: string;
+    }
+  | {
+      type: 'transaction';
+      from_index: number;
+      to_index: number;
+      protocol_version: number;
+      tx_id: number;
+      tx_hash: string;
+      events: LedgerEvent[];
+    };
+
+export interface ShieldedSyncResult {
+  updates: ShieldedSyncUpdate[];
+  applied_through: number;
+  highest_index: number;
+  scanned_transactions: number;
+}
+
+export interface DustSyncResult {
+  events: LedgerEvent[];
+  scanned_through: number;
+  highest_event_id: number;
 }
 
 export interface LedgerParameters {
@@ -100,11 +138,15 @@ export class NightfrostApi {
   constructor(private readonly network: NetworkDef) {}
 
   syncStatus(): Promise<SyncStatus> {
-    return this.request<SyncStatus>('/sync-status');
+    return this.request<SyncStatus>('/sync');
   }
 
   addressBalances(address: string): Promise<TokenBalance[]> {
     return this.request<TokenBalance[]>(`/addresses/${address}`);
+  }
+
+  addressUtxos(address: string): Promise<Utxo[]> {
+    return this.request<Utxo[]>(`/addresses/${address}/utxos`);
   }
 
   addressTxs(address: string, cursor?: string): Promise<ApiEnvelope<string[]>> {
@@ -136,12 +178,38 @@ export class NightfrostApi {
   }
 
   ledgerEvents(from: number, cursor?: string): Promise<ApiEnvelope<LedgerEvent[]>> {
-    return this.requestEnvelope<LedgerEvent[]>('/ledger-events', {
+    return this.requestEnvelope<LedgerEvent[]>('/ledger/events', {
       from,
-      count: 100,
+      count: 5_000,
       order: 'asc',
       cursor,
     });
+  }
+
+  walletEvents(
+    viewingKey: string,
+    from: number,
+    count = 5_000,
+  ): Promise<ApiEnvelope<WalletEventsResult>> {
+    return this.postEnvelope<WalletEventsResult>('/wallet/events', {
+      viewing_key: viewingKey,
+      from,
+      count,
+    });
+  }
+
+  walletShieldedSync(
+    viewingKey: string,
+    fromIndex: number,
+  ): Promise<ApiEnvelope<ShieldedSyncResult>> {
+    return this.postEnvelope<ShieldedSyncResult>('/wallet-sync/shielded', {
+      viewing_key: viewingKey,
+      from_index: fromIndex,
+    });
+  }
+
+  walletDustSync(from: number, count = 50_000): Promise<ApiEnvelope<DustSyncResult>> {
+    return this.requestEnvelope<DustSyncResult>('/wallet-sync/dust', { from, count });
   }
 
   addressTxsSince(address: string, from: number, cursor?: string): Promise<ApiEnvelope<string[]>> {
@@ -180,6 +248,31 @@ export class NightfrostApi {
       throw new ApiError(response.status, message);
     }
     return (await response.json()) as SubmitResult;
+  }
+
+  private async postEnvelope<T>(path: string, payload: unknown): Promise<ApiEnvelope<T>> {
+    const url = new URL(`${this.network.apiUrl}/api/v0${path}`);
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch {
+      throw new ApiError(0, `Could not reach ${this.network.name} at ${this.network.apiUrl}.`);
+    }
+    if (!response.ok) {
+      let message = response.statusText || `HTTP ${response.status}`;
+      try {
+        const body = (await response.json()) as { message?: string };
+        if (body.message) message = body.message;
+      } catch {
+        // Keep the HTTP status text for a non-JSON error.
+      }
+      throw new ApiError(response.status, message);
+    }
+    return (await response.json()) as ApiEnvelope<T>;
   }
 
   private async request<T>(path: string): Promise<T> {

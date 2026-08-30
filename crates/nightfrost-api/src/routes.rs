@@ -21,6 +21,7 @@ pub struct ApiState {
     pub node_url: String,
     pub highest_block: NodeTipHeight,
     pub cursor_codec: CursorCodec,
+    pub wallet_scan_lock: Arc<std::sync::Mutex<()>>,
 }
 
 type AppState = Arc<ApiState>;

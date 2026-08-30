@@ -1,0 +1,75 @@
+@import '../../explorer/src/style.css';
+
+.faucet-outlet { min-height: calc(100vh - 150px); }
+.faucet-product {
+  padding-left: 10px;
+  border-left: 1px solid var(--hairline);
+  font-size: .78rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.faucet-spacer { flex: 1; }
+.faucet-hero { max-width: 920px; margin: 64px auto 42px; }
+.faucet-inner {
+  min-height: 430px;
+  justify-content: center;
+  padding: 62px clamp(24px, 7vw, 74px);
+}
+.faucet-kicker { color: var(--accent); }
+.faucet-copy { max-width: 650px; font-size: 1rem; }
+.faucet-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(100%, 760px);
+  margin-top: 10px;
+}
+.faucet-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.faucet-input {
+  width: 100%;
+  min-width: 0;
+  padding: 11px 14px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  color: var(--ink);
+  outline: none;
+}
+.faucet-input:focus {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--hairline));
+  box-shadow: 0 0 0 3px var(--glow);
+}
+.faucet-submit { min-height: 42px; min-width: 122px; white-space: nowrap; }
+.faucet-submit:disabled { cursor: wait; opacity: .6; }
+.faucet-status { min-height: 24px; padding-top: 5px; font-size: .86rem; }
+.faucet-status.is-busy { display: flex; align-items: center; gap: 8px; }
+.faucet-status.state-error { color: var(--bad); }
+.faucet-status.state-ok { color: var(--ok); }
+.spin {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: faucet-spin .9s linear infinite;
+}
+@keyframes faucet-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation-duration: 2.4s; } }
+.faucet-note { max-width: 760px; font-size: .78rem; }
+.faucet-network { display: flex; gap: 8px; margin: 3px 0 6px; }
+.faucet-network .net-pill[aria-pressed='true'] {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--hairline));
+  color: var(--ink);
+  background: var(--panel);
+}
+.faucet-ready { display: inline-flex; align-items: center; gap: 7px; }
+.faucet-ready-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+
+@media (max-width: 620px) {
+  .faucet-hero { margin-top: 28px; }
+  .faucet-inner { min-height: 390px; padding: 40px 20px; }
+  .faucet-row { grid-template-columns: 1fr; }
+  .faucet-submit { width: 100%; }
+  .faucet-product { display: none; }
+}

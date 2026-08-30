@@ -324,8 +324,7 @@ impl Counters {
 }
 
 /// Wall time accumulated per pipeline stage, logged and reset every
-/// PROGRESS_LOG_INTERVAL blocks so catch-up bottlenecks show up in the logs
-/// (docs/ROADMAP.md 2a).
+/// PROGRESS_LOG_INTERVAL blocks so catch-up bottlenecks show up in the logs.
 #[derive(Default)]
 struct StageTimes {
     fetch: Duration,
@@ -506,6 +505,9 @@ fn index_block(
 /// Everything derived from applying one transaction.
 struct AppliedTransaction {
     hash: [u8; 32],
+    protocol_version: u32,
+    zswap_start_index: u64,
+    zswap_end_index: u64,
     variant: TransactionVariant,
     result: TransactionResult,
     fees: u128,
@@ -530,6 +532,8 @@ fn apply_transaction(
     parent_block_timestamp: u64,
     bump_tblock: bool,
 ) -> anyhow::Result<AppliedTransaction> {
+    let zswap_start_index = ledger_state.zswap_first_free();
+    let protocol_version = u32::from(block.protocol_version);
     match transaction {
         Transaction::Regular(tx) => {
             // Reproduce the node's mempool-cached tblock bump for the first
@@ -631,6 +635,9 @@ fn apply_transaction(
 
             Ok(AppliedTransaction {
                 hash: tx.hash.0,
+                protocol_version,
+                zswap_start_index,
+                zswap_end_index: ledger_state.zswap_first_free(),
                 variant: TransactionVariant::Regular,
                 result: outcome.transaction_result,
                 fees: outcome.fees,
@@ -650,6 +657,9 @@ fn apply_transaction(
 
             Ok(AppliedTransaction {
                 hash: tx.hash.0,
+                protocol_version,
+                zswap_start_index,
+                zswap_end_index: ledger_state.zswap_first_free(),
                 variant: TransactionVariant::System,
                 result: TransactionResult::Success,
                 fees: 0,
@@ -690,6 +700,16 @@ fn write_block(
         let tx_id = ids.next_tx_id;
         ids.next_tx_id += 1;
         let first_event_id = ids.next_event_id;
+
+        batch.insert(
+            &store.wallet_tx_indices,
+            tx_id.to_be_bytes(),
+            store::encode(&store::WalletTxIndexRecord {
+                zswap_start_index: applied.zswap_start_index,
+                zswap_end_index: applied.zswap_end_index,
+                protocol_version: applied.protocol_version,
+            }),
+        );
 
         // Secondary key indexes.
         batch.insert(
@@ -855,6 +875,12 @@ fn write_block(
                 store::encode(&record),
             );
             let event = &record.event;
+            if matches!(
+                event.grouping,
+                nightfrost_core::domain::LedgerEventGrouping::Dust
+            ) {
+                batch.insert(&store.wallet_dust_events, event_id.to_be_bytes(), []);
+            }
 
             match &event.attributes {
                 // Keyed by night_utxo_hash, NOT generation_index/mt_index: the
@@ -990,6 +1016,16 @@ fn write_block(
     batch.insert(
         &store.meta,
         meta_keys::NEXT_EVENT_ID,
+        ids.next_event_id.to_be_bytes(),
+    );
+    batch.insert(
+        &store.meta,
+        meta_keys::WALLET_TX_INDEXED_THROUGH,
+        ids.next_tx_id.to_be_bytes(),
+    );
+    batch.insert(
+        &store.meta,
+        meta_keys::WALLET_DUST_INDEXED_THROUGH,
         ids.next_event_id.to_be_bytes(),
     );
     batch.insert(
