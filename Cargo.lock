@@ -3495,7 +3495,7 @@ checksum = "685a9ac4b61f4e728e1d2c6a7844609c16527aeb5e6c865915c08e619c16410f"
 
 [[package]]
 name = "nightfrost"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3515,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "nightfrost-api"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3535,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "nightfrost-chain"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3557,7 +3557,7 @@ dependencies = [
 
 [[package]]
 name = "nightfrost-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "const-hex",
  "derive_more 2.1.1",
