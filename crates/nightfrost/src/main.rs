@@ -135,11 +135,29 @@ enum SnapshotCommand {
         #[arg(long)]
         output: String,
     },
-    /// Extract a `snapshot save` archive into a fresh data directory.
+    /// Extract a `snapshot save` archive into a fresh data directory, either
+    /// from a local file (`--input`) or by downloading the latest nightly
+    /// snapshot published by nightfrost.dev (`--trust-me-bro`).
     Restore {
         /// Archive produced by `snapshot save`
+        #[arg(
+            long,
+            required_unless_present = "trust_me_bro",
+            conflicts_with = "trust_me_bro"
+        )]
+        input: Option<String>,
+
+        /// Download and restore the newest published snapshot for
+        /// `--network-id` instead of a local archive. You are trusting the
+        /// publisher's data directory wholesale; verify against the chain
+        /// afterwards if that matters to you.
         #[arg(long)]
-        input: String,
+        trust_me_bro: bool,
+
+        /// Base URL the published snapshots live under; each network has a
+        /// `<base>/<network>/latest` pointer naming the newest archive.
+        #[arg(long, env = "NIGHTFROST_SNAPSHOT_URL", default_value = snapshot::DEFAULT_SNAPSHOT_URL)]
+        snapshot_url: String,
 
         /// Destination data directory; must not already exist
         #[arg(long, env = "NIGHTFROST_DATA_DIR", default_value = "./data")]
@@ -208,9 +226,31 @@ async fn main() -> anyhow::Result<()> {
                 println!("snapshot written to {output}");
                 Ok(())
             }
-            SnapshotCommand::Restore { input, data_dir } => {
+            SnapshotCommand::Restore {
+                input: Some(input),
+                data_dir,
+                ..
+            } => {
                 snapshot::restore(&input, &data_dir)
                     .with_context(|| format!("restore snapshot {input} into {data_dir}"))?;
+                println!("snapshot restored into {data_dir}");
+                Ok(())
+            }
+            SnapshotCommand::Restore {
+                input: None,
+                snapshot_url,
+                data_dir,
+                ..
+            } => {
+                // The ledger treats an empty network id as mainnet; the
+                // published snapshots live under the spelled-out name.
+                let network = match args.network_id.as_str() {
+                    "" => "mainnet",
+                    other => other,
+                };
+                snapshot::restore_published(&snapshot_url, network, &data_dir).with_context(
+                    || format!("restore the published {network} snapshot into {data_dir}"),
+                )?;
                 println!("snapshot restored into {data_dir}");
                 Ok(())
             }
