@@ -1,6 +1,7 @@
 import '../../light-wallet/src/polyfills.ts';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import { NightfrostApi } from '../../light-wallet/src/api.ts';
 import { isNativeToken } from '../../light-wallet/src/format.ts';
 import { openNightfrostWallet, type LocalWalletSession } from '../../light-wallet/src/nightfrost-sdk.ts';
@@ -14,6 +15,9 @@ type Claim = { id: string; network: NetworkId; state: ClaimState; message: strin
 const PORT = Number(process.env.NIGHTFROST_FAUCET_PORT || '3210');
 const HOST = process.env.NIGHTFROST_FAUCET_HOST || '127.0.0.1';
 const MNEMONIC = process.env.NIGHTFROST_FAUCET_SEED_PHRASE?.trim() || '';
+const PROVING_SERVER_URL = new URL(
+  process.env.NIGHTFROST_FAUCET_PROVING_SERVER_URL || 'http://127.0.0.1:6300',
+);
 const CLAIM_STAR = 1_337_000n; // 1.337 NIGHT per claim
 const RETRY_MS = 15_000;
 const CLAIM_TTL_MS = 24 * 60 * 60 * 1_000;
@@ -34,7 +38,7 @@ const NETWORKS: Record<NetworkId, NetworkDef> = {
     apiUrl: process.env.NIGHTFROST_FAUCET_PREPROD_API || 'https://preprod.nightfrost.dev',
     faucetUrl: null,
     color: '#8fd0e4',
-    enabled: true,
+    enabled: false,
   },
 };
 
@@ -47,13 +51,18 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-class FaucetWallet {
+export class FaucetWallet {
   state: Lifecycle = 'starting';
   message = 'Faucet wallet is starting…';
   session: LocalWalletSession | undefined;
   activeClaim: string | undefined;
 
-  constructor(readonly network: NetworkDef) {}
+  constructor(readonly network: NetworkDef) {
+    if (!network.enabled) {
+      this.state = 'error';
+      this.message = `${network.name} is unavailable until its indexer is ready.`;
+    }
+  }
 
   async start(): Promise<never> {
     for (;;) {
@@ -74,7 +83,12 @@ class FaucetWallet {
   private async initialize(): Promise<void> {
     this.state = 'syncing';
     this.message = 'Faucet wallet is syncing…';
-    const session = await openNightfrostWallet(MNEMONIC, this.network);
+    const session = await openNightfrostWallet(
+      MNEMONIC,
+      this.network,
+      undefined,
+      PROVING_SERVER_URL,
+    );
     this.session = session;
     console.info(`[faucet:${this.network.networkId}] funding address ${session.address}`);
     await session.ready;
@@ -152,6 +166,18 @@ class FaucetWallet {
       claim.state = 'failed';
       claim.message = errorMessage(error);
       console.error(`[faucet:${this.network.networkId}:${claim.id}]`, error);
+      this.state = 'syncing';
+      this.message = 'Faucet wallet is recovering from a rejected transaction…';
+      try {
+        await this.session!.resync();
+        this.state = 'ready';
+        this.message = 'Faucet is ready.';
+        console.info(`[faucet:${this.network.networkId}] wallet resynced after failed transfer`);
+      } catch (recoveryError) {
+        this.state = 'error';
+        this.message = `Wallet recovery failed: ${errorMessage(recoveryError)}`;
+        console.error(`[faucet:${this.network.networkId}]`, this.message);
+      }
     } finally {
       this.activeClaim = undefined;
     }
@@ -243,24 +269,28 @@ const server = createServer((request, response) => {
   });
 });
 
-if (!MNEMONIC) {
-  console.error('NIGHTFROST_FAUCET_SEED_PHRASE is required.');
-  process.exit(1);
-}
-
-for (const wallet of Object.values(wallets)) void wallet.start();
-const cleanup = setInterval(() => {
-  const cutoff = Date.now() - CLAIM_TTL_MS;
-  for (const [id, claim] of claims) if (claim.createdAt < cutoff) claims.delete(id);
-}, 60 * 60 * 1_000);
-cleanup.unref();
-
-server.listen(PORT, HOST, () => console.info(`Nightfrost faucet listening on http://${HOST}:${PORT}`));
-
 async function shutdown(): Promise<void> {
   server.close();
   await Promise.all(Object.values(wallets).map((wallet) => wallet.session?.stop().catch(() => undefined)));
   process.exit(0);
 }
-process.on('SIGTERM', () => void shutdown());
-process.on('SIGINT', () => void shutdown());
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  if (!MNEMONIC) {
+    console.error('NIGHTFROST_FAUCET_SEED_PHRASE is required.');
+    process.exit(1);
+  }
+
+  for (const wallet of Object.values(wallets)) {
+    if (wallet.network.enabled) void wallet.start();
+  }
+  const cleanup = setInterval(() => {
+    const cutoff = Date.now() - CLAIM_TTL_MS;
+    for (const [id, claim] of claims) if (claim.createdAt < cutoff) claims.delete(id);
+  }, 60 * 60 * 1_000);
+  cleanup.unref();
+
+  server.listen(PORT, HOST, () => console.info(`Nightfrost faucet listening on http://${HOST}:${PORT}`));
+  process.on('SIGTERM', () => void shutdown());
+  process.on('SIGINT', () => void shutdown());
+}

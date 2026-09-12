@@ -133,6 +133,19 @@ const proofWorkerDevPlugin: Plugin = {
   },
 };
 
+// The wallet proves through a Midnight proof server on its own origin: the
+// SDK's HTTP prover client posts to the absolute paths /prove and /check, so
+// they are proxied at the root rather than under a prefix. Run one locally
+// with `podman run --rm -p 127.0.0.1:6300:6300 docker.io/midnightntwrk/proof-server:8.1.0 midnight-proof-server`
+// (or build with VITE_PROVING_SERVER_URL=browser to prove in the tab instead).
+const proofServerProxy = {
+  target: process.env.NIGHTFROST_PROOF_SERVER || 'http://127.0.0.1:6300',
+  changeOrigin: true,
+  // Proving a transaction on the server can take a while; the SDK waits.
+  timeout: 15 * 60 * 1_000,
+  proxyTimeout: 15 * 60 * 1_000,
+};
+
 export default defineConfig({
   plugins: [wasm(), proofWorkerDevPlugin],
   resolve: {
@@ -173,6 +186,14 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.slice('/proving-material'.length),
       },
+      '/prove': proofServerProxy,
+      '/check': proofServerProxy,
+    },
+  },
+  preview: {
+    proxy: {
+      '/prove': proofServerProxy,
+      '/check': proofServerProxy,
     },
   },
   build: {

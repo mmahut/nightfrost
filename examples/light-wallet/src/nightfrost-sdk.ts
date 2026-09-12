@@ -17,7 +17,10 @@ import {
   type DefaultConfiguration,
   type UnshieldedKeystore,
 } from '@midnightntwrk/wallet-sdk';
-import { makeWasmProvingService } from '@midnightntwrk/wallet-sdk/capabilities/proving';
+import {
+  makeServerProvingService,
+  makeWasmProvingService,
+} from '@midnightntwrk/wallet-sdk/capabilities/proving';
 import {
   SubmissionEvent,
   type SubmissionService,
@@ -765,6 +768,7 @@ export async function openNightfrostWallet(
   words: string,
   network: NetworkDef,
   onProgress?: (progress: SyncProgress) => void,
+  provingServerUrl?: URL,
 ): Promise<LocalWalletSession> {
   const mnemonic = words.trim().toLowerCase().replace(/\s+/g, ' ');
   if (!validateMnemonic(mnemonic)) {
@@ -840,7 +844,9 @@ export async function openNightfrostWallet(
         factories.UnshieldedWallet.startWithPublicKey(PublicKey.fromKeyStore(keystore)),
       dust: () => factories.DustWallet.startWithSecretKey(dustKey, ledgerParameters.dust),
       provingService: () =>
-        makeWasmProvingService({ keyMaterialProvider: makeProvingKeyMaterialProvider() }),
+        provingServerUrl
+          ? makeServerProvingService({ provingServerUrl })
+          : makeWasmProvingService({ keyMaterialProvider: makeProvingKeyMaterialProvider() }),
       submissionService: () => makeSubmissionService(configuration),
       pendingTransactionsService: () => makePendingTransactionsService(configuration),
     });
@@ -913,7 +919,7 @@ export async function openNightfrostWallet(
         keystore.getPublicKey(),
         (payload) => keystore.signData(payload),
       );
-      onStage?.('Generating the zero-knowledge proof locally…');
+      onStage?.('Generating the zero-knowledge proof…');
       const finalized = await wallet.finalizeRecipe(recipe);
       onStage?.('Submitting the registration and waiting for confirmation…');
       const identifier = await wallet.submitTransaction(finalized);
@@ -940,7 +946,7 @@ export async function openNightfrostWallet(
       );
       onStage?.('Signing the transaction locally…');
       const signed = await wallet.signRecipe(recipe, (payload) => keystore.signData(payload));
-      onStage?.('Generating the zero-knowledge proof locally…');
+      onStage?.('Generating the zero-knowledge proof…');
       const finalized = await wallet.finalizeRecipe(signed);
       onStage?.('Submitting the transaction and waiting for confirmation…');
       const identifier = await wallet.submitTransaction(finalized);
