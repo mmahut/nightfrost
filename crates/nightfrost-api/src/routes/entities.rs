@@ -1299,16 +1299,11 @@ async fn dust_registrations_inner(
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<ApiResponse<Vec<RegistrationResponse>>>, ApiError> {
     let prefix = match &stake_key {
-        Some(stake_key) => {
-            let key = const_hex::decode(stake_key)
-                .map_err(|_| ApiError::bad_request("invalid stake_key (hex)"))?;
-            // Registration keys start with the full 29-byte Cardano reward
-            // address; anything shorter would prefix-match other stake keys.
-            if key.len() != 29 {
-                return Err(ApiError::bad_request("stake_key must be 29 bytes of hex"));
-            }
-            key
-        }
+        // Registration keys start with the full 29-byte Cardano reward
+        // address; anything shorter would prefix-match other stake keys, so
+        // the parser's fixed-size result is what keeps this lookup exact.
+        // Same parser as /dust/status so both endpoints accept hex or bech32.
+        Some(stake_key) => parse_stake_key(stake_key)?.to_vec(),
         None => vec![],
     };
     let query_scope = scope(&[b"dust_registrations", &prefix], pagination.order);
