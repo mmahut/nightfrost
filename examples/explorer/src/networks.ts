@@ -73,16 +73,29 @@ export function networks(): NetworkDef[] {
   return list;
 }
 
+/** `?network=preview` (id or display name, case-insensitive) wins over the
+ *  stored choice, so links from the wallet and faucet open the right chain. */
+function networkFromQuery(list: NetworkDef[]): NetworkDef | undefined {
+  const wanted = new URLSearchParams(location.search).get('network')?.trim().toLowerCase();
+  if (!wanted) return undefined;
+  return list.find((n) => n.name.toLowerCase() === wanted);
+}
+
 export function activeNetwork(): NetworkDef {
   const list = networks();
+  const fromQuery = networkFromQuery(list);
+  if (fromQuery) return fromQuery;
   const stored = read(ACTIVE_KEY);
   return list.find((n) => n.name === stored) ?? list[0];
 }
 
-/** Persist the selection and reload: fresh caches, same route (hash survives). */
+/** Persist the selection and reload: fresh caches, same route (hash survives).
+ *  The query parameter is rewritten too, or it would pin the previous network. */
 export function selectNetwork(name: string): void {
   write(ACTIVE_KEY, name);
-  location.reload();
+  const url = new URL(location.href);
+  url.searchParams.set('network', name.toLowerCase());
+  location.replace(url.toString());
 }
 
 /** Footer escape hatch: set (and switch to) a custom API URL; empty clears it. */
@@ -95,5 +108,7 @@ export function setCustomApi(url: string): void {
     write(CUSTOM_KEY, null);
     write(ACTIVE_KEY, null);
   }
-  location.reload();
+  const target = new URL(location.href);
+  target.searchParams.delete('network');
+  location.replace(target.toString());
 }

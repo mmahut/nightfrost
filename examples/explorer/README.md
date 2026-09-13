@@ -82,3 +82,5 @@ src/
   starfield.ts   dashboard hero canvas (static under prefers-reduced-motion)
   pages/         home, block, tx, address, contract, search
 ```
+
+`?network=<name>` in the URL (case-insensitive, e.g. `?network=preview`) selects a configured network and takes precedence over the remembered choice; the wallet and faucet link to transactions this way.
