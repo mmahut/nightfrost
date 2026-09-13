@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:e2e": "node --experimental-transform-types --test e2e/wallet.e2e.mts"
   },
   "dependencies": {
     "@midnight-ntwrk/ledger-v8": "8.1.1",
