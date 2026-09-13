@@ -32,6 +32,10 @@ use crate::{
     ledger_db::FjallLedgerDb,
 };
 use itertools::Itertools;
+
+/// Serialises the arena garbage collector against out-of-pipeline readers;
+/// see [`LedgerState::hold_arena`].
+static ARENA_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 use midnight_base_crypto_v1::{
     cost_model::{FixedPoint, NormalizedCost, SyntheticCost},
     hash::{HashOutput, persistent_commit},
@@ -480,7 +484,34 @@ impl LedgerState {
     /// Returns the number of nodes culled. The bound is observed best-effort:
     /// gc() checks the budget between batches and stops when exceeded.
     pub fn gc(bound: std::time::Duration) -> usize {
+        let _exclusive = ARENA_LOCK
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         default_storage::<FjallLedgerDb>().with_backend(|b| b.gc(bound))
+    }
+
+    /// Guard to hold while loading a persisted ledger state and reading from
+    /// it outside the indexing pipeline (API handlers). The arena sweep in
+    /// `gc` frees nodes no persisted root references; a concurrently loaded
+    /// state creates references it cannot see, which surfaced in production
+    /// as tokio worker panics ("attempted to increment non-existant ref")
+    /// during wallet shielded syncs. Readers share the lock; only the sweep
+    /// takes it exclusively. Never hold this across an `.await`.
+    pub fn hold_arena() -> std::sync::RwLockReadGuard<'static, ()> {
+        ARENA_LOCK
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Exclusive counterpart for the pipeline: held for a whole block's
+    /// ledger work (apply, roots, persist, unpersist). Applying a block
+    /// allocates and evicts arena nodes too, so a reader loading a persisted
+    /// state concurrently can still reach a node that just went away; the gc
+    /// sweep is not the only mutator. Do not call `gc` while holding this.
+    pub fn exclusive_arena() -> std::sync::RwLockWriteGuard<'static, ()> {
+        ARENA_LOCK
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Apply the given serialized regular transaction to this ledger state and return the

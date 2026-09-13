@@ -1106,6 +1106,11 @@ pub async fn wallet_events(
                         let ledger_version = ProtocolVersion::try_from(block.protocol_version)
                             .map_err(internal)?
                             .ledger_version();
+                        // Ledger transactions are arena-backed: deserialising,
+                        // the relevance walk, and the drop all touch refcounts
+                        // the pipeline may be sweeping. Same per-transaction
+                        // guard as the shielded-sync scan; no `.await` inside.
+                        let _arena = LedgerState::hold_arena();
                         Transaction::deserialize(&tx.raw, ledger_version)
                             .map_err(internal)?
                             .relevant(&viewing_key)
@@ -1594,6 +1599,10 @@ fn scan_wallet_relevance(
             let ledger_version = ProtocolVersion::try_from(index.protocol_version)
                 .map_err(|error| error.to_string())?
                 .ledger_version();
+            // Deserialising a ledger transaction allocates arena nodes, so
+            // keep the sweep out per transaction: a full-chain scan runs for
+            // minutes and must not stall the pipeline's gc for that long.
+            let _arena = LedgerState::hold_arena();
             if Transaction::deserialize(&tx.raw, ledger_version)
                 .map_err(|error| error.to_string())?
                 .relevant(viewing_key)
@@ -1689,6 +1698,9 @@ pub async fn wallet_shielded_sync(
         .0
         .last()
         .ok_or_else(|| ApiError::internal("wallet sync requires a persisted ledger state"))?;
+    // No `.await` below this point: the arena guard must not outlive the
+    // synchronous section, and the loaded state is dropped with it.
+    let arena = LedgerState::hold_arena();
     let ledger_state = LedgerState::load(ledger_key, (*ledger_version).into()).map_err(internal)?;
     if ledger_state.zswap_first_free() < highest_index {
         return Err(ApiError::internal(
@@ -1781,6 +1793,8 @@ pub async fn wallet_shielded_sync(
         });
         applied_through = highest_index;
     }
+    drop(ledger_state);
+    drop(arena);
 
     let mut headers = HeaderMap::new();
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));

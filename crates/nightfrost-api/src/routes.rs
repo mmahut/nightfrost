@@ -332,11 +332,15 @@ pub async fn ledger_parameters_latest(
     let ledger_version = ProtocolVersion::try_from(block.protocol_version)
         .map_err(internal)?
         .ledger_version();
-    let ledger_state = LedgerState::load(state_key, ledger_version).map_err(internal)?;
-    let ledger_parameters = ledger_state
-        .ledger_parameters()
-        .serialize()
-        .map_err(internal)?;
+    let ledger_parameters = {
+        // Keep the arena sweep out while this state is loaded and read.
+        let _arena = LedgerState::hold_arena();
+        let ledger_state = LedgerState::load(state_key, ledger_version).map_err(internal)?;
+        ledger_state
+            .ledger_parameters()
+            .serialize()
+            .map_err(internal)?
+    };
 
     response(
         &state,

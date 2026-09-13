@@ -251,6 +251,7 @@ pub async fn run(
                 .push((new_key, ledger_state.ledger_version().into()));
             while window.0.len() > LEDGER_STATE_RETENTION {
                 let (key, version) = window.0.remove(0);
+                let _arena = LedgerState::exclusive_arena();
                 LedgerState::unpersist(&key, LedgerVersion::from(version))
                     .context("unpersist ledger state beyond retention window")?;
             }
@@ -388,6 +389,9 @@ fn index_block(
     LedgerState,
     nightfrost_core::domain::SerializedLedgerStateKey,
 )> {
+    // API handlers read persisted ledger states through the same arena;
+    // keep them out for the duration of this block's ledger mutations.
+    let _arena = LedgerState::exclusive_arena();
     let ledger_version = block.protocol_version.ledger_version();
 
     ledger_state = if block.height == 0 {
