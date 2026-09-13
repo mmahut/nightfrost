@@ -113,7 +113,67 @@ type NightfrostConfiguration = DefaultConfiguration & {
   viewingKey: string;
   onProgress?: (progress: SyncProgress) => void;
   pollIntervalMs: number;
+  utxoFilter: UtxoFilter;
+  dustSyncGate?: () => boolean;
 };
+
+/// Decides which synced UTXOs enter the unshielded wallet state; `own` says
+/// whether this wallet's address owns it. The default keeps only own coins.
+export type UtxoFilter = (utxo: Utxo, own: boolean) => boolean;
+const ownUtxosOnly: UtxoFilter = (_utxo, own) => own;
+
+/// One input of a built transaction, as the ledger will see it.
+export interface BuiltInput {
+  intent: number;
+  segment: 'guaranteed' | 'fallible';
+  intentHash: string;
+  outputNo: number;
+  value: string;
+  owner: string;
+}
+
+export interface BuiltTransactionSummary {
+  inputs: BuiltInput[];
+  dustSpends: number;
+  dustRegistrations: number;
+}
+
+/// Test-only hooks. `utxoFilter` deliberately lets a test corrupt the
+/// wallet's view (e.g. admit foreign coins) to reproduce failures;
+/// `onTransactionBuilt` reports what a transaction spends before it is
+/// submitted. Neither is used by the wallet UI or the faucet.
+export interface WalletDiagnostics {
+  utxoFilter?: UtxoFilter;
+  onTransactionBuilt?: (summary: BuiltTransactionSummary) => void;
+  /// Test-only: while this returns false the DUST core stops receiving new
+  /// events, simulating a wallet whose DUST view lags the chain.
+  dustSyncGate?: () => boolean;
+}
+
+function summarize(tx: ledger.FinalizedTransaction): BuiltTransactionSummary {
+  const summary: BuiltTransactionSummary = { inputs: [], dustSpends: 0, dustRegistrations: 0 };
+  for (const [intentId, intent] of tx.intents ?? new Map()) {
+    const offers: Array<['guaranteed' | 'fallible', ledger.UnshieldedOffer<ledger.SignatureEnabled> | undefined]> = [
+      ['guaranteed', intent.guaranteedUnshieldedOffer],
+      ['fallible', intent.fallibleUnshieldedOffer],
+    ];
+    for (const [segment, offer] of offers) {
+      for (const input of offer?.inputs ?? []) {
+        summary.inputs.push({
+          intent: Number(intentId),
+          segment,
+          intentHash: String(input.intentHash),
+          outputNo: input.outputNo,
+          value: String(input.value),
+          owner: String(input.owner),
+        });
+      }
+    }
+    summary.dustSpends += intent.dustActions?.spends.length ?? 0;
+    summary.dustRegistrations += intent.dustActions?.registrations.length ?? 0;
+  }
+  return summary;
+}
 
 type UnshieldedTransactionUpdate = {
   kind: 'transaction';
@@ -161,8 +221,8 @@ type DustUpdate = {
 
 export interface SendResult {
   identifier: string;
-  /** Indexed transaction hash; absent when the post-submit lookup failed. */
-  hash?: string;
+  /** Indexed transaction hash; the transaction was included with status `success`. */
+  hash: string;
 }
 
 export interface DustStatus {
@@ -274,8 +334,18 @@ function walletUtxo(utxo: Utxo, fallbackTime: number): UnshieldedV1.UnshieldedSt
   });
 }
 
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/// Normalises an owner field for comparison with the wallet's own address.
+const sameOwner = (a: string, b: string) =>
+  a.replace(/^0x/, '').toLowerCase() === b.replace(/^0x/, '').toLowerCase();
+
 async function unshieldedTransaction(
   api: NightfrostApi,
+  ownerHex: string,
+  utxoFilter: UtxoFilter,
   hash: string,
 ): Promise<UnshieldedTransactionUpdate> {
   const [tx, utxos] = await Promise.all([api.tx(hash), api.txUtxos(hash)]);
@@ -291,8 +361,17 @@ async function unshieldedTransaction(
     estimatedFees: BigInt(tx.estimated_fees),
     status: tx.variant === 'System' ? 'SUCCESS' : sdkStatus(tx.status),
     segments: tx.segments?.map(([id, success]) => ({ id, success })) ?? null,
-    createdUtxos: utxos.outputs.map((utxo) => walletUtxo(utxo, tx.block_time)),
-    spentUtxos: utxos.inputs.map((utxo) => walletUtxo(utxo, tx.block_time)),
+    // The indexer lists every input and output of the transaction; only
+    // the ones this address owns belong in its wallet state. Without the
+    // filter the counterparty's change outputs became "our" coins, coin
+    // selection spent them, and the node failed the transfer segment while
+    // still charging the fee.
+    createdUtxos: utxos.outputs
+      .filter((utxo) => utxoFilter(utxo, sameOwner(utxo.owner, ownerHex)))
+      .map((utxo) => walletUtxo(utxo, tx.block_time)),
+    spentUtxos: utxos.inputs
+      .filter((utxo) => utxoFilter(utxo, sameOwner(utxo.owner, ownerHex)))
+      .map((utxo) => walletUtxo(utxo, tx.block_time)),
   };
 }
 
@@ -318,7 +397,12 @@ function makeUnshieldedSync(config: NightfrostConfiguration) {
 
         const updates: UnshieldedUpdate[] = [];
         for (const hash of hashes) {
-          const update = await unshieldedTransaction(config.api, hash);
+          const update = await unshieldedTransaction(
+            config.api,
+            state.publicKey.addressHex,
+            config.utxoFilter,
+            hash,
+          );
           if (update.id > appliedId) updates.push(update);
         }
 
@@ -456,6 +540,7 @@ function makeDustSync(config: NightfrostConfiguration) {
       let appliedThrough = Number(state.progress.appliedIndex);
       return pollingStream(
         async () => {
+          if (config.dustSyncGate && !config.dustSyncGate()) return [];
           const [response, blockData] = await Promise.all([
             config.api.walletDustSync(appliedThrough),
             config.api.ledgerParameters(),
@@ -769,6 +854,7 @@ export async function openNightfrostWallet(
   network: NetworkDef,
   onProgress?: (progress: SyncProgress) => void,
   provingServerUrl?: URL,
+  diagnostics: WalletDiagnostics = {},
 ): Promise<LocalWalletSession> {
   const mnemonic = words.trim().toLowerCase().replace(/\s+/g, ' ');
   if (!validateMnemonic(mnemonic)) {
@@ -779,11 +865,91 @@ export async function openNightfrostWallet(
   // Submission already waited for the transaction to be indexed, so the hash
   // is resolvable immediately; treat a failed lookup as cosmetic (the UI
   // falls back to showing the identifier).
-  const lookupTxHash = (identifier: string): Promise<string | undefined> =>
-    api
-      .txByIdentifier(identifier)
-      .then((tx) => tx.hash)
-      .catch(() => undefined);
+  /// Inclusion is not success: a Midnight transaction can land with its
+  /// guaranteed segment (the DUST fee) applied while a fallible segment (the
+  /// actual transfer) failed, and the node still charges the fee. The
+  /// submission service only waits for inclusion, so read the indexed status
+  /// and refuse to report a transfer that moved nothing.
+  const confirmApplied = async (identifier: string): Promise<{ hash: string; status: string }> => {
+    let tx: Tx | undefined;
+    for (let attempt = 0; attempt < 10 && tx === undefined; attempt += 1) {
+      tx = await api.txByIdentifier(identifier).catch(() => undefined);
+      if (tx === undefined) await new Promise((resolve) => setTimeout(resolve, 3_000));
+    }
+    if (tx === undefined) {
+      throw new Error(
+        `The transaction was submitted (identifier ${identifier}) but Nightfrost has not indexed it yet; check the explorer before retrying.`,
+      );
+    }
+    if (tx.status !== 'success') {
+      // Drop the locally applied effects of this transaction before anyone
+      // builds another one on top of them.
+      await rebuild().catch((error) => {
+        console.warn('Nightfrost: resync after a failed transaction did not complete', error);
+      });
+      const failed = (tx.segments ?? [])
+        .filter(([, ok]) => !ok)
+        .map(([segment]) => segment)
+        .join(', ');
+      throw new Error(
+        `Transaction ${tx.hash} was included with status ${tx.status}` +
+          (failed ? ` (failed segment${failed.includes(',') ? 's' : ''} ${failed})` : '') +
+          ': the fee was charged but the transfer was not applied. This usually means the wallet spent an output that was already gone; resync and try again.',
+      );
+    }
+    return { hash: tx.hash, status: tx.status };
+  };
+
+  /// The node verifies a DUST spend against the commitment and generation
+  /// roots that were current at the spend's declared time, so a wallet whose
+  /// DUST view misses even one fee payment by anyone since its last poll is
+  /// rejected with ledger error 170 (`InvalidDustSpendProof`). Reproduced
+  /// deterministically by freezing the DUST sync for 150 s before spending.
+  /// The poll runs every two seconds, so the cure is to let it catch up and
+  /// rebuild: the recipe (and its DUST spend) must be recomputed each time.
+  const STALE_DUST_ATTEMPTS = 3;
+  const isStaleDustRejection = (error: unknown) =>
+    error instanceof Error && /custom error: 170\b/.test(error.message);
+  const withStaleDustRetry = async <T>(
+    onStage: TransactionStageReporter | undefined,
+    attempt: () => Promise<T>,
+  ): Promise<T> => {
+    for (let n = 1; ; n += 1) {
+      try {
+        return await attempt();
+      } catch (error) {
+        if (!isStaleDustRejection(error) || n >= STALE_DUST_ATTEMPTS) throw error;
+        onStage?.(
+          `The DUST view was behind the chain; refreshing and rebuilding (attempt ${n + 1} of ${STALE_DUST_ATTEMPTS})…`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, 2 * POLL_INTERVAL_MS + 1_000));
+      }
+    }
+  };
+
+  /// After a successful spend, wait until the local unshielded state has
+  /// dropped the inputs the transaction consumed, so a follow-up transfer
+  /// from this session cannot select them again and fail the same way.
+  const awaitInputsSettled = async (hash: string): Promise<void> => {
+    const spent = await api
+      .txUtxos(hash)
+      .then((utxos) =>
+        utxos.inputs
+          .filter((utxo) => utxo.owner.replace(/^0x/, '') === keystore.getAddress())
+          .map((utxo) => `${utxo.intent_hash.replace(/^0x/, '')}:${utxo.output_index}`),
+      )
+      .catch((): string[] => []);
+    if (spent.length === 0) return;
+    const deadline = Date.now() + 90_000;
+    for (;;) {
+      const available = await availableNightUtxos();
+      const stillListed = available.some((coin) =>
+        spent.includes(`${String(coin.utxo.intentHash).replace(/^0x/, '')}:${coin.utxo.outputNo}`),
+      );
+      if (!stillListed || Date.now() > deadline) return;
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+    }
+  };
   const blockData = await api.ledgerParameters();
   const ledgerParameters = ledger.LedgerParameters.deserialize(
     hexBytes(blockData.ledger_parameters),
@@ -818,26 +984,33 @@ export async function openNightfrostWallet(
   derived.keys[Roles.Zswap].fill(0);
   derived.keys[Roles.Dust].fill(0);
   const keystore: UnshieldedKeystore = createKeystore(unshieldedSeed, network.networkId);
-  const txHistoryStorage = new InMemoryTransactionHistoryStorage(
-    WalletEntrySchema,
-    mergeWalletEntries,
-  );
-  const configuration: NightfrostConfiguration = {
+  // The history storage is per facade on purpose: the SDK's pending
+  // transaction service keeps a transaction whose fallible segment failed
+  // on chain applied locally (its change outputs become phantom coins), and
+  // a rebuilt facade that inherited the same storage re-applied them. Seen
+  // in production as a faucet spending outputs that were long gone.
+  const makeConfiguration = (): NightfrostConfiguration => ({
     networkId: network.networkId,
     costParameters: { feeBlocksMargin: 5 },
     relayURL: new URL(network.apiUrl),
     indexerClientConnection: { indexerHttpUrl: network.apiUrl },
-    txHistoryStorage,
+    txHistoryStorage: new InMemoryTransactionHistoryStorage(WalletEntrySchema, mergeWalletEntries),
     api,
     viewingKey,
     onProgress,
     pollIntervalMs: POLL_INTERVAL_MS,
-  };
-  const factories = walletFactories(configuration);
+    utxoFilter: diagnostics.utxoFilter ?? ownUtxosOnly,
+    dustSyncGate: diagnostics.dustSyncGate,
+  });
 
-  let wallet: WalletFacade;
-  try {
-    wallet = await WalletFacade.init({
+  // The cores complete their state streams when stopped, so a facade cannot
+  // be restarted in place: `resync` builds a fresh one from the same key
+  // material instead, and everything below reads `wallet` through this
+  // binding so it always sees the live instance.
+  const buildWallet = async (): Promise<WalletFacade> => {
+    const configuration = makeConfiguration();
+    const factories = walletFactories(configuration);
+    const facade = await WalletFacade.init({
       configuration,
       shielded: () => factories.ShieldedWallet.startWithSecretKeys(shieldedKeys),
       unshielded: () =>
@@ -850,25 +1023,90 @@ export async function openNightfrostWallet(
       submissionService: () => makeSubmissionService(configuration),
       pendingTransactionsService: () => makePendingTransactionsService(configuration),
     });
-  } catch (error) {
+    try {
+      await facade.start(shieldedKeys, dustKey);
+    } catch (error) {
+      await facade.stop().catch(() => undefined);
+      throw error;
+    }
+    return facade;
+  };
+  const clearKeys = () => {
     shieldedKeys.clear();
     dustKey.clear();
     unshieldedSeed.fill(0);
-    throw error;
-  }
+  };
 
+  let wallet: WalletFacade;
   try {
-    await wallet.start(shieldedKeys, dustKey);
+    wallet = await buildWallet();
   } catch (error) {
-    await wallet.stop().catch(() => undefined);
-    shieldedKeys.clear();
-    dustKey.clear();
-    unshieldedSeed.fill(0);
+    clearKeys();
     throw error;
   }
 
-  const ready = wallet.waitForSyncedState().then(() => undefined);
-  void ready.catch(() => undefined);
+  const awaitSynced = (facade: WalletFacade) => {
+    const synced = facade.waitForSyncedState().then(() => undefined);
+    void synced.catch(() => undefined);
+    return synced;
+  };
+  let ready = awaitSynced(wallet);
+
+  // Key material is still held (it's only cleared in stop()), so a fresh
+  // facade can be built and synced from scratch. The old cores are stopped
+  // first; their state streams complete, which is exactly why they cannot
+  // simply be restarted.
+  const rebuild = async (): Promise<void> => {
+    const previous = wallet;
+    await previous.stop().catch((error) => {
+      console.warn('Nightfrost resync: stopping the stuck cores failed', error);
+    });
+    wallet = await buildWallet();
+    ready = awaitSynced(wallet);
+    await ready;
+  };
+
+  /// The unshielded core's view can silently fall behind the chain (seen in
+  /// production after a day of uptime: the faucet spent outputs that were
+  /// long gone, so the node applied the DUST fee segment and failed the
+  /// transfer). Spending is the one moment that must not happen, so compare
+  /// the local coin set with the indexer's before building and rebuild the
+  /// wallet when they disagree.
+  const ensureFreshUnshieldedState = async (
+    onStage?: TransactionStageReporter,
+  ): Promise<void> => {
+    // Fail closed: a spend built on an unverified coin set can be included
+    // with its fee taken and its transfer refused, so if the chain view is
+    // unavailable, refuse to build rather than guess. Retry briefly first so
+    // one dropped request does not turn into a user-facing error.
+    let indexed: Utxo[] | undefined;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3 && indexed === undefined; attempt += 1) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 2_000));
+      indexed = await api.addressUtxos(keystore.getAddress()).catch((error: unknown) => {
+        lastError = error;
+        return undefined;
+      });
+    }
+    if (indexed === undefined) {
+      throw new Error(
+        `Could not verify this wallet's outputs against Nightfrost (${errorText(lastError)}); nothing was sent. Try again in a moment.`,
+      );
+    }
+    const onChain = new Set(
+      indexed.map((utxo) => `${utxo.intent_hash.replace(/^0x/, '')}:${utxo.output_index}`),
+    );
+    const local = await availableNightUtxos();
+    const stale = local.filter(
+      (coin) => !onChain.has(`${String(coin.utxo.intentHash).replace(/^0x/, '')}:${coin.utxo.outputNo}`),
+    );
+    if (stale.length === 0) return;
+    console.warn(
+      `Nightfrost: ${stale.length} of ${local.length} local NIGHT outputs are no longer on chain; rebuilding the wallet before spending`,
+    );
+    onStage?.('Wallet state is stale; resyncing before building the transaction…');
+    await rebuild();
+  };
 
   const dustAddress = MidnightBech32m.encode(
     network.networkId,
@@ -881,12 +1119,18 @@ export async function openNightfrostWallet(
   };
 
   return {
-    wallet,
+    get wallet() {
+      return wallet;
+    },
     addressHex: keystore.getAddress(),
     address: keystore.getBech32Address().asString(),
-    state: wallet.state(),
+    get state() {
+      return wallet.state();
+    },
     dustAddress,
-    ready,
+    get ready() {
+      return ready;
+    },
     dustStatus: async () => {
       const [nightUtxos, dustState] = await Promise.all([
         availableNightUtxos(),
@@ -900,6 +1144,7 @@ export async function openNightfrostWallet(
       };
     },
     registerForDustGeneration: async (onStage) => {
+      await ensureFreshUnshieldedState(onStage);
       onStage?.('Checking available NIGHT outputs…');
       const nightUtxos = (await availableNightUtxos()).filter(
         (coin) => !coin.meta.registeredForDustGeneration,
@@ -913,61 +1158,60 @@ export async function openNightfrostWallet(
       const { fee } = await wallet.estimateRegistration(nightUtxos);
       onStage?.('Waiting until the NIGHT output has generated ' + fee + ' DUST specks…');
       await wallet.waitForGeneratedDust(nightUtxos, fee, { timeoutMs: 15 * 60 * 1_000 });
-      onStage?.('Building and signing the DUST registration…');
-      const recipe = await wallet.registerNightUtxosForDustGeneration(
-        nightUtxos,
-        keystore.getPublicKey(),
-        (payload) => keystore.signData(payload),
-      );
-      onStage?.('Generating the zero-knowledge proof…');
-      const finalized = await wallet.finalizeRecipe(recipe);
-      onStage?.('Submitting the registration and waiting for confirmation…');
-      const identifier = await wallet.submitTransaction(finalized);
-      return { identifier, hash: await lookupTxHash(identifier) };
+      const identifier = await withStaleDustRetry(onStage, async () => {
+        onStage?.('Building and signing the DUST registration…');
+        const recipe = await wallet.registerNightUtxosForDustGeneration(
+          nightUtxos,
+          keystore.getPublicKey(),
+          (payload) => keystore.signData(payload),
+        );
+        onStage?.('Generating the zero-knowledge proof…');
+        const finalized = await wallet.finalizeRecipe(recipe);
+        diagnostics.onTransactionBuilt?.(summarize(finalized));
+        onStage?.('Submitting the registration and waiting for confirmation…');
+        return wallet.submitTransaction(finalized);
+      });
+      const { hash } = await confirmApplied(identifier);
+      return { identifier, hash };
     },
     sendUnshielded: async (receiver, amount, onStage) => {
-      onStage?.('Selecting NIGHT and DUST inputs…');
       if (amount <= 0n) throw new Error('Amount must be greater than zero.');
-      const recipe = await wallet.transferTransaction(
-        [
-          {
-            type: 'unshielded',
-            outputs: [
-              {
-                amount,
-                receiverAddress: parseRecipient(receiver, network.networkId),
-                type: ledger.unshieldedToken().raw,
-              },
-            ],
-          },
-        ],
-        { shieldedSecretKeys: shieldedKeys, dustSecretKey: dustKey },
-        { ttl: new Date(Date.now() + 30 * 60 * 1_000), payFees: true },
-      );
-      onStage?.('Signing the transaction locally…');
-      const signed = await wallet.signRecipe(recipe, (payload) => keystore.signData(payload));
-      onStage?.('Generating the zero-knowledge proof…');
-      const finalized = await wallet.finalizeRecipe(signed);
-      onStage?.('Submitting the transaction and waiting for confirmation…');
-      const identifier = await wallet.submitTransaction(finalized);
-      return { identifier, hash: await lookupTxHash(identifier) };
-    },
-    resync: async () => {
-      // Key material is still held by this tab (it's only cleared in stop()),
-      // so the cores can relaunch their background sync in place. The facade's
-      // state observables survive the restart, which keeps `ready` and every
-      // existing subscription working.
-      await wallet.stop().catch((error) => {
-        console.warn('Nightfrost resync: stopping the stuck cores failed', error);
+      await ensureFreshUnshieldedState(onStage);
+      const identifier = await withStaleDustRetry(onStage, async () => {
+        onStage?.('Selecting NIGHT and DUST inputs…');
+        const recipe = await wallet.transferTransaction(
+          [
+            {
+              type: 'unshielded',
+              outputs: [
+                {
+                  amount,
+                  receiverAddress: parseRecipient(receiver, network.networkId),
+                  type: ledger.unshieldedToken().raw,
+                },
+              ],
+            },
+          ],
+          { shieldedSecretKeys: shieldedKeys, dustSecretKey: dustKey },
+          { ttl: new Date(Date.now() + 30 * 60 * 1_000), payFees: true },
+        );
+        onStage?.('Signing the transaction locally…');
+        const signed = await wallet.signRecipe(recipe, (payload) => keystore.signData(payload));
+        onStage?.('Generating the zero-knowledge proof…');
+        const finalized = await wallet.finalizeRecipe(signed);
+        diagnostics.onTransactionBuilt?.(summarize(finalized));
+        onStage?.('Submitting the transaction and waiting for confirmation…');
+        return wallet.submitTransaction(finalized);
       });
-      await wallet.start(shieldedKeys, dustKey);
-      await wallet.waitForSyncedState();
+      const { hash } = await confirmApplied(identifier);
+      onStage?.('Confirmed; waiting for the wallet to account for the spent outputs…');
+      await awaitInputsSettled(hash);
+      return { identifier, hash };
     },
+    resync: rebuild,
     stop: async () => {
       await wallet.stop();
-      shieldedKeys.clear();
-      dustKey.clear();
-      unshieldedSeed.fill(0);
+      clearKeys();
     },
   };
 }

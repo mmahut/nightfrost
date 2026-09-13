@@ -145,8 +145,21 @@ export class NightfrostApi {
     return this.request<TokenBalance[]>(`/addresses/${address}`);
   }
 
-  addressUtxos(address: string): Promise<Utxo[]> {
-    return this.request<Utxo[]>(`/addresses/${address}/utxos`);
+  /// Every unspent output of the address, following pagination. Callers
+  /// compare this with local wallet state, so a truncated first page would
+  /// read as coins vanishing from the chain and trigger needless resyncs.
+  async addressUtxos(address: string): Promise<Utxo[]> {
+    const utxos: Utxo[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.requestEnvelope<Utxo[]>(`/addresses/${address}/utxos`, {
+        count: 5_000,
+        cursor,
+      });
+      utxos.push(...page.results);
+      cursor = page.next_cursor ?? undefined;
+    } while (cursor !== undefined);
+    return utxos;
   }
 
   addressTxs(address: string, cursor?: string): Promise<ApiEnvelope<string[]>> {
