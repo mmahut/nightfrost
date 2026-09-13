@@ -62,7 +62,7 @@ VITE_PROVING_SERVER_URL=browser npm run build
 
 Browser proving needs no server but takes several minutes per transaction
 and fetches the prover keys through the same-origin `/proving-material/`
-proxy.
+proxy, which the dev and preview servers provide.
 
 Transaction links use the hosted Nightfrost explorer by default. To use a local
 explorer:
@@ -90,7 +90,8 @@ circuit witnesses is sent to that server, while signing keys never leave the
 tab. The adapter submits the view-only Zswap encryption secret key to Nightfrost for stateless trial decryption; spending keys remain local. The finalized serialized transaction also reaches Nightfrost when sent.
 
 The overview guides the complete testnet flow: open a locally derived wallet, copy
-the address into the official Preview/Preprod faucet, register received NIGHT
+the address into the [Nightfrost faucet](https://faucet.nightfrost.dev) (the
+sibling `examples/faucet`, serving Preview and Preprod), register received NIGHT
 UTXOs for DUST generation, and then send an unshielded native NIGHT transfer.
 Registration and transfer recipes are signed locally and proven by the proof server. Fees are selected
 from the wallet's synced DUST state. The adapter waits for a
@@ -128,7 +129,9 @@ the JavaScript and WASM APIs permit it. Browser JavaScript cannot guarantee
 secure memory erasure, so do not paste a phrase that protects real funds.
 
 The **Generate test phrase** button creates a fresh 24-word BIP39 phrase with
-browser cryptographic randomness. The official faucets use Cloudflare Turnstile,
-so the example opens the network faucet in a new tab and copies the receive
-address rather than attempting to proxy or bypass its anti-abuse check. `STAR` is the smallest NIGHT unit:
+browser cryptographic randomness. The receive tab copies the address and opens
+the Nightfrost faucet for the selected network in a new tab; the faucet sends
+1.337 NIGHT per claim. `STAR` is the smallest NIGHT unit:
 `1 NIGHT = 1,000,000 STAR`.
+
+`?network=preview` (or `preprod`) in the URL selects the network on load, and the wallet's links to the faucet and explorer carry the same parameter.

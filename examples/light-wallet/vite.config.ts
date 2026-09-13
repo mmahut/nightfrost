@@ -14,7 +14,7 @@ const proofWorker = fileURLToPath(
 // Keep this URL versioned. The worker is fetched independently of the hashed
 // application bundle; reusing a filename lets a CDN retain an older worker
 // after the main application has been redeployed.
-const proofWorkerPublicPath = '/dist/proof-worker-v6.js';
+const proofWorkerPublicPath = '/dist/proof-worker-v7.js';
 
 const proofWorkerDevPlugin: Plugin = {
   name: 'nightfrost-proof-worker',
@@ -64,7 +64,7 @@ const proofWorkerDevPlugin: Plugin = {
       const rewritten = code
         .replace(
           '../../dist/proof-worker.js',
-          '../../dist/proof-worker-v6.js',
+          '../../dist/proof-worker-v7.js',
         )
         .replace(upstreamMessageHandler, diagnosticMessageHandler);
       const upstreamHandler = [
@@ -138,6 +138,12 @@ const proofWorkerDevPlugin: Plugin = {
 // they are proxied at the root rather than under a prefix. Run one locally
 // with `podman run --rm -p 127.0.0.1:6300:6300 docker.io/midnightntwrk/proof-server:8.1.0 midnight-proof-server`
 // (or build with VITE_PROVING_SERVER_URL=browser to prove in the tab instead).
+const provingMaterialProxy = {
+  target: 'https://midnight-s3-fileshare-dev-eu-west-1.s3.eu-west-1.amazonaws.com',
+  changeOrigin: true,
+  rewrite: (path: string) => path.slice('/proving-material'.length),
+};
+
 const proofServerProxy = {
   target: process.env.NIGHTFROST_PROOF_SERVER || 'http://127.0.0.1:6300',
   changeOrigin: true,
@@ -181,17 +187,14 @@ export default defineConfig({
         target: 'https://preview.nightfrost.dev',
         changeOrigin: true,
       },
-      '/proving-material': {
-        target: 'https://midnight-s3-fileshare-dev-eu-west-1.s3.eu-west-1.amazonaws.com',
-        changeOrigin: true,
-        rewrite: (path) => path.slice('/proving-material'.length),
-      },
+      '/proving-material': provingMaterialProxy,
       '/prove': proofServerProxy,
       '/check': proofServerProxy,
     },
   },
   preview: {
     proxy: {
+      '/proving-material': provingMaterialProxy,
       '/prove': proofServerProxy,
       '/check': proofServerProxy,
     },
@@ -201,11 +204,11 @@ export default defineConfig({
     // Wallet-capable browsers already support it, so preserve it in output.
     target: 'esnext',
     rollupOptions: {
-      input: { main, 'dist/proof-worker-v6': proofWorker },
+      input: { main, 'dist/proof-worker-v7': proofWorker },
       output: {
         entryFileNames: (chunk) =>
-          chunk.name === 'dist/proof-worker-v6'
-            ? 'dist/proof-worker-v6.js'
+          chunk.name === 'dist/proof-worker-v7'
+            ? 'dist/proof-worker-v7.js'
             : 'assets/[name]-[hash].js',
       },
     },

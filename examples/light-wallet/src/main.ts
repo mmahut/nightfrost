@@ -8,13 +8,17 @@ import {
   type TxStatus,
   type TxUtxos,
   type Utxo,
+  type SyncStatus,
 } from './api.ts';
 import { formatNight, formatRawAmount, formatTime, isNativeToken, truncate } from './format.ts';
 import {
   BROWSER_PROVING,
   EXPLORER_URL,
   NETWORKS,
+  networkFromQuery,
   PROVING_SERVER_URL,
+  rememberNetworkInUrl,
+  withNetworkQuery,
   type NetworkDef,
 } from './networks.ts';
 import { formatNightAddress, generateRecoveryPhrase, NIGHT_DERIVATION_PATH } from './wallet.ts';
@@ -29,7 +33,7 @@ const THEME_KEY = 'nf.theme';
 const THEME_ICONS: Record<Theme, string> = { auto: '◐', light: '☀', dark: '☾' };
 const THEME_NEXT: Record<Theme, Theme> = { dark: 'light', light: 'auto', auto: 'dark' };
 
-let activeNetwork = NETWORKS[0];
+let activeNetwork = networkFromQuery() ?? NETWORKS[0];
 let walletAddress: string | null = null;
 let walletSession: LocalWalletSession | null = null;
 let walletSync = new Map<SyncCore, SyncProgress>();
@@ -40,6 +44,10 @@ let txCursors: Array<string | undefined> = [undefined];
 let txPage = 0;
 let renderVersion = 0;
 let syncOverlayDismissed = false;
+/// Latest indexer sync report for the active network; null until fetched.
+/// DUST registration is held back while Nightfrost is behind the node,
+/// because a recipe built against a stale tip is rejected on submission.
+let indexerSync: SyncStatus | null = null;
 
 /// DUST math: 1 DUST = 1e15 specks; each NIGHT (1e6 STAR) can back up to
 /// 5 DUST, so the capacity per STAR is 5e9 specks.
@@ -434,6 +442,7 @@ function selectNetwork(network: NetworkDef): void {
   if (network.name === activeNetwork.name) return;
 
   activeNetwork = network;
+  rememberNetworkInUrl(network);
   txCursors = [undefined];
   txPage = 0;
   document.querySelector('.site-header')?.replaceWith(buildHeader());
@@ -591,6 +600,7 @@ function renderLanding(): void {
           walletSync = new Map();
           walletSyncReady = false;
           walletSyncError = null;
+          indexerSync = null;
           walletResyncing = false;
           syncOverlayDismissed = false;
           const { openNightfrostWallet } = await import('./nightfrost-sdk.ts');
@@ -689,8 +699,16 @@ function renderWallet(): void {
   const pageLabel = el('span', { class: 'pager-label mono' }, `page ${txPage + 1}`);
   const previous = el('button', { class: 'pager-btn', type: 'button' }, '← prev');
   const next = el('button', { class: 'pager-btn', type: 'button' }, 'next →');
+  const refresh = el(
+    'button',
+    { class: 'pager-btn wallet-refresh-btn', type: 'button', title: 'Reload this page of transactions' },
+    '↻ refresh',
+  );
   previous.disabled = txPage === 0;
   next.disabled = true;
+  refresh.addEventListener('click', () => {
+    void loadTransactions(version, address, txBody, previous, next, pageLabel);
+  });
 
   const loadPage = (page: number) => {
     if (page < 0 || page >= txCursors.length) return;
@@ -724,7 +742,7 @@ function renderWallet(): void {
       ),
       txBody,
     ),
-    el('div', { class: 'pager' }, previous, pageLabel, next),
+    el('div', { class: 'pager' }, previous, pageLabel, next, refresh),
   );
   let lastNight = 0n;
   let lastDust: DustStatus | null = null;
@@ -735,8 +753,13 @@ function renderWallet(): void {
     const session = walletSession;
     void (async () => {
       try {
-        const balances = await new NightfrostApi(activeNetwork).addressBalances(address);
+        const api = new NightfrostApi(activeNetwork);
+        const [balances, sync] = await Promise.all([
+          api.addressBalances(address),
+          api.syncStatus().catch(() => null),
+        ]);
         if (version !== renderVersion) return;
+        indexerSync = sync;
         lastNight = BigInt(
           balances.find((item) => isNativeToken(item.token_type))?.amount ?? '0',
         );
@@ -879,6 +902,9 @@ function renderWallet(): void {
       return;
     }
     refreshStatus();
+    // Incoming transfers should appear without a manual reload; refresh the
+    // first page in place (no skeleton flash) while the user is on it.
+    if (txPage === 0) void loadTransactions(version, address, txBody, previous, next, pageLabel, true);
   }, 20_000);
 }
 
@@ -1145,7 +1171,7 @@ function buildOnboarding(receiveAddress: string, onUpdated: () => void): Onboard
     'a',
     {
       class: 'search-go setup-step-action faucet-link',
-      href: activeNetwork.faucetUrl ?? '#',
+      href: activeNetwork.faucetUrl ? withNetworkQuery(activeNetwork.faucetUrl, activeNetwork) : '#',
       target: '_blank',
       rel: 'noopener noreferrer',
     },
@@ -1218,17 +1244,24 @@ function buildOnboarding(receiveAddress: string, onUpdated: () => void): Onboard
       status.textContent = 'NIGHT received • waiting for the local wallet to finish syncing…';
       return;
     }
+    if (dust.registeredUtxos > 0) {
+      // Already generating DUST: onboarding is over, even if a later UTXO
+      // (a change output, another faucet claim) is not registered yet.
+      // Offering "Generate DUST" again here read as a stuck step.
+      node.hidden = true;
+      return;
+    }
     if (dust.unregisteredUtxos > 0) {
       node.hidden = false;
       mark(stepGet, 'done');
       mark(stepDust, 'active');
+      if (indexerSync !== null && !indexerSync.caught_up) {
+        register.disabled = true;
+        status.textContent = `Nightfrost is still catching up with the chain (${indexerSync.percentage.toFixed(1)}% • block ${indexerSync.indexed_height.toLocaleString()} of ${indexerSync.node_height.toLocaleString()}). Generate DUST unlocks once it is synced.`;
+        return;
+      }
       register.disabled = false;
       status.textContent = '';
-      return;
-    }
-    if (dust.registeredUtxos > 0) {
-      // Funded and generating: onboarding is over.
-      node.hidden = true;
       return;
     }
     node.hidden = false;
@@ -1502,11 +1535,14 @@ async function loadTransactions(
   previous: HTMLButtonElement,
   next: HTMLButtonElement,
   pageLabel: HTMLElement,
+  quiet = false,
 ): Promise<void> {
-  clear(body).append(skeleton(6));
-  previous.disabled = true;
-  next.disabled = true;
-  delete next.dataset.cursor;
+  if (!quiet) {
+    clear(body).append(skeleton(6));
+    previous.disabled = true;
+    next.disabled = true;
+    delete next.dataset.cursor;
+  }
 
   try {
     const api = new NightfrostApi(activeNetwork);
@@ -1532,9 +1568,14 @@ async function loadTransactions(
     if (page.next_cursor !== null) {
       next.dataset.cursor = page.next_cursor;
       next.disabled = false;
+    } else {
+      delete next.dataset.cursor;
+      next.disabled = true;
     }
   } catch (error) {
     if (version !== renderVersion) return;
+    // A failed background refresh keeps the rows that are already shown.
+    if (quiet) return;
     clear(body).append(errorState(error, 'transactions'));
     previous.disabled = txPage === 0;
   }
@@ -1546,7 +1587,7 @@ function explorerTxLink(hash: string): HTMLElement {
     {
       class: 'mono tx-explorer-link',
       title: `Open ${hash} in Nightfrost explorer`,
-      href: `${EXPLORER_URL}/#/tx/${hash}`,
+      href: `${withNetworkQuery(EXPLORER_URL + '/', activeNetwork)}#/tx/${hash}`,
       target: '_blank',
       rel: 'noopener noreferrer',
     },

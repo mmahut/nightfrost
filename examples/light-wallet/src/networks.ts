@@ -67,6 +67,39 @@ function configuredNetworks(): NetworkDef[] {
 
 export const NETWORKS = configuredNetworks();
 
+/// Query-string network selection, shared by the wallet, faucet and explorer:
+/// `?network=preview` picks the network on load, and every link between the
+/// apps carries the same parameter so the choice follows the user. Matches
+/// the network id or display name, case-insensitively; disabled networks
+/// (Mainnet here) are ignored.
+export function networkFromQuery(
+  search: string = typeof location === 'undefined' ? '' : location.search,
+): NetworkDef | undefined {
+  const wanted = new URLSearchParams(search).get('network')?.trim().toLowerCase();
+  if (!wanted) return undefined;
+  return NETWORKS.find(
+    (network) =>
+      network.enabled &&
+      (network.networkId === wanted || network.name.toLowerCase() === wanted),
+  );
+}
+
+/// Adds `?network=<id>` to a URL, keeping any existing query and hash.
+export function withNetworkQuery(url: string, network: NetworkDef): string {
+  const target = new URL(url, typeof location === 'undefined' ? 'http://localhost' : location.href);
+  target.searchParams.set('network', network.networkId);
+  return target.toString();
+}
+
+/// Reflects the active network in the address bar without a navigation, so
+/// the current page can be shared and reloads land on the same network.
+export function rememberNetworkInUrl(network: NetworkDef): void {
+  if (typeof history === 'undefined') return;
+  const url = new URL(location.href);
+  url.searchParams.set('network', network.networkId);
+  history.replaceState(history.state, '', url.toString());
+}
+
 /**
  * Where zero-knowledge proofs are generated. By default the wallet talks to a
  * Midnight proof server on its own origin: the SDK's HTTP prover client posts
