@@ -13,7 +13,18 @@ const COLORS: Record<Network, string> = { preview: '#f0b429', preprod: '#8fd0e4'
 const THEME_KEY = 'nf.theme';
 const THEME_ICONS: Record<Theme, string> = { auto: '◐', light: '☀', dark: '☾' };
 const THEME_NEXT: Record<Theme, Theme> = { dark: 'light', light: 'auto', auto: 'dark' };
-let network: Network = 'preview';
+/// `?network=preview|preprod` selects the network on load (the wallet links
+/// here with it); switching updates the address bar so the page is shareable.
+function networkFromQuery(): Network {
+  const wanted = new URLSearchParams(location.search).get('network')?.trim().toLowerCase();
+  return wanted === 'preprod' ? 'preprod' : 'preview';
+}
+function rememberNetworkInUrl(value: Network): void {
+  const url = new URL(location.href);
+  url.searchParams.set('network', value);
+  history.replaceState(history.state, '', url.toString());
+}
+let network: Network = networkFromQuery();
 let statusTimer: ReturnType<typeof setTimeout> | undefined;
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -55,6 +66,7 @@ function networkButton(value: Network): HTMLButtonElement {
   button.addEventListener('click', () => {
     if (network === value) return;
     network = value;
+    rememberNetworkInUrl(value);
     render();
   });
   return button;
@@ -93,21 +105,48 @@ function setStatus(node: HTMLElement, message: string, kind = ''): void {
   node.append(document.createTextNode(message));
 }
 
+/// A response that says nothing about the claim itself: the network was
+/// down, or nginx answered for a faucet that was too busy to reply in time
+/// (an HTML 502/504 page, not JSON). Polls keep waiting through these.
+class TransientError extends Error {}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, init);
-  const body = (await response.json()) as T & { message?: string };
-  if (!response.ok) throw new Error(body.message || `Request failed (HTTP ${response.status}).`);
+  let response: Response;
+  try {
+    response = await fetch(path, init);
+  } catch {
+    throw new TransientError('The faucet is unreachable right now.');
+  }
+  const text = await response.text();
+  let body: (T & { message?: string }) | undefined;
+  try {
+    body = JSON.parse(text) as T & { message?: string };
+  } catch {
+    body = undefined;
+  }
+  if (!response.ok) {
+    const message = body?.message || `Request failed (HTTP ${response.status}).`;
+    if (response.status === 502 || response.status === 503 || response.status === 504 || body === undefined) {
+      throw new TransientError(message);
+    }
+    throw new Error(message);
+  }
+  if (body === undefined) throw new TransientError('The faucet returned an unreadable response.');
   return body;
 }
 
+/// How long a claim poll tolerates transient errors before giving up.
+const POLL_PATIENCE_MS = 15 * 60 * 1_000;
+
 function waitForClaim(id: string, status: HTMLElement, submit: HTMLButtonElement): void {
+  const startedAt = Date.now();
   const poll = async (): Promise<void> => {
     try {
       const claim = await api<ClaimResponse>(`/api/claims/${encodeURIComponent(id)}`);
       if (claim.state === 'complete') {
         status.className = 'faucet-status state-ok';
         status.replaceChildren(document.createTextNode('Sent 1.337 NIGHT · '));
-        const link = el('a', { href: `https://explorer.nightfrost.dev/#/tx/${claim.message}`, target: '_blank', rel: 'noreferrer' }, 'view transaction');
+        const link = el('a', { href: `https://explorer.nightfrost.dev/?network=${network}#/tx/${claim.message}`, target: '_blank', rel: 'noreferrer' }, 'view transaction');
         status.append(link);
         submit.disabled = false;
         submit.textContent = 'Send 1.337 NIGHT';
@@ -117,6 +156,11 @@ function waitForClaim(id: string, status: HTMLElement, submit: HTMLButtonElement
       setStatus(status, claim.message, 'is-busy');
       statusTimer = setTimeout(() => void poll(), 2_000);
     } catch (error) {
+      if (error instanceof TransientError && Date.now() - startedAt < POLL_PATIENCE_MS) {
+        setStatus(status, 'The faucet is busy; still waiting for your transfer…', 'is-busy');
+        statusTimer = setTimeout(() => void poll(), 5_000);
+        return;
+      }
       setStatus(status, error instanceof Error ? error.message : String(error), 'state-error');
       submit.disabled = false;
       submit.textContent = 'Send 1.337 NIGHT';

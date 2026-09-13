@@ -2,198 +2,125 @@ import '../../light-wallet/src/polyfills.ts';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { NightfrostApi } from '../../light-wallet/src/api.ts';
-import { isNativeToken } from '../../light-wallet/src/format.ts';
-import { openNightfrostWallet, type LocalWalletSession } from '../../light-wallet/src/nightfrost-sdk.ts';
+import { Worker } from 'node:worker_threads';
 import type { NetworkDef } from '../../light-wallet/src/networks.ts';
+import {
+  CLAIM_TTL_MS,
+  errorMessage,
+  HttpError,
+  MAX_BODY_BYTES,
+  MNEMONIC,
+  NETWORKS,
+  RETRY_MS,
+  type Claim,
+  type Lifecycle,
+  type NetworkId,
+} from './faucet-wallet.ts';
+import type { WorkerCommand, WorkerEvent } from './wallet-worker.ts';
 
-type NetworkId = 'preview' | 'preprod';
-type Lifecycle = 'starting' | 'syncing' | 'waiting_funds' | 'registering' | 'waiting_dust' | 'ready' | 'error';
-type ClaimState = 'queued' | 'sending' | 'complete' | 'failed';
-type Claim = { id: string; network: NetworkId; state: ClaimState; message: string; createdAt: number };
+// Re-exported for the test suite, which drives the wallet in-process.
+export { FaucetWallet } from './faucet-wallet.ts';
 
 const PORT = Number(process.env.NIGHTFROST_FAUCET_PORT || '3210');
 const HOST = process.env.NIGHTFROST_FAUCET_HOST || '127.0.0.1';
-const MNEMONIC = process.env.NIGHTFROST_FAUCET_SEED_PHRASE?.trim() || '';
-const PROVING_SERVER_URL = new URL(
-  process.env.NIGHTFROST_FAUCET_PROVING_SERVER_URL || 'http://127.0.0.1:6300',
-);
-const CLAIM_STAR = 1_337_000n; // 1.337 NIGHT per claim
-const RETRY_MS = 15_000;
-const CLAIM_TTL_MS = 24 * 60 * 60 * 1_000;
-const MAX_BODY_BYTES = 4_096;
-
-const NETWORKS: Record<NetworkId, NetworkDef> = {
-  preview: {
-    name: 'Preview',
-    networkId: 'preview',
-    apiUrl: process.env.NIGHTFROST_FAUCET_PREVIEW_API || 'https://preview.nightfrost.dev',
-    faucetUrl: null,
-    color: '#f0b429',
-    enabled: true,
-  },
-  preprod: {
-    name: 'Preprod',
-    networkId: 'preprod',
-    apiUrl: process.env.NIGHTFROST_FAUCET_PREPROD_API || 'https://preprod.nightfrost.dev',
-    faucetUrl: null,
-    color: '#8fd0e4',
-    enabled: false,
-  },
-};
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
-}
-
-export class FaucetWallet {
+/// Main-thread stand-in for one network's wallet, which lives in a worker
+/// thread (see wallet-worker.ts). Mirrors the worker's lifecycle state so
+/// /api/status and claim admission stay synchronous and instant, and
+/// respawns the worker if it ever dies.
+class WalletProxy {
   state: Lifecycle = 'starting';
   message = 'Faucet wallet is starting…';
-  session: LocalWalletSession | undefined;
   activeClaim: string | undefined;
+  private worker: Worker | undefined;
+  private stopping = false;
 
-  constructor(readonly network: NetworkDef) {
+  constructor(
+    readonly network: NetworkDef,
+    private readonly onClaim: (claim: Claim) => void,
+  ) {
     if (!network.enabled) {
       this.state = 'error';
       this.message = `${network.name} is unavailable until its indexer is ready.`;
     }
   }
 
-  async start(): Promise<never> {
-    for (;;) {
-      try {
-        await this.initialize();
-        await new Promise<never>(() => undefined);
-      } catch (error) {
-        this.state = 'error';
-        this.message = `Wallet startup failed; retrying: ${errorMessage(error)}`;
-        console.error(`[faucet:${this.network.networkId}]`, this.message);
-        await this.session?.stop().catch(() => undefined);
-        this.session = undefined;
-        await sleep(RETRY_MS);
-      }
-    }
-  }
-
-  private async initialize(): Promise<void> {
-    this.state = 'syncing';
-    this.message = 'Faucet wallet is syncing…';
-    const session = await openNightfrostWallet(
-      MNEMONIC,
-      this.network,
-      undefined,
-      PROVING_SERVER_URL,
-    );
-    this.session = session;
-    console.info(`[faucet:${this.network.networkId}] funding address ${session.address}`);
-    await session.ready;
-
-    const api = new NightfrostApi(this.network);
-    this.state = 'waiting_funds';
-    this.message = 'Faucet is waiting to be funded…';
-    for (;;) {
-      const balances = await api.addressBalances(session.addressHex);
-      const night = BigInt(balances.find((balance) => /^(?:0x)?0{64}$/i.test(balance.token_type))?.amount ?? '0');
-      if (night >= CLAIM_STAR) break;
-      await sleep(RETRY_MS);
-    }
-
-    // Decide registration from the indexer's UTXO flags, not the wallet
-    // session's dustStatus(): the session's view can lag behind the indexer
-    // funding check above, which once made the faucet skip registration and
-    // then wait forever for DUST that unregistered NIGHT never generates.
-    const needsRegistration = async () => {
-      const utxos = await api.addressUtxos(session.addressHex);
-      return utxos.some(
-        (utxo) => isNativeToken(utxo.token_type) && !utxo.registered_for_dust_generation,
-      );
-    };
-    const dust = await session.dustStatus();
-    console.info(
-      `[faucet:${this.network.networkId}] dust status registered=${dust.registeredUtxos} unregistered=${dust.unregisteredUtxos} balance=${dust.balance} indexerNeedsRegistration=${await needsRegistration()}`,
-    );
-    if (await needsRegistration()) {
-      this.state = 'registering';
-      this.message = 'Faucet is registering its NIGHT for DUST generation…';
-      // The wallet must see the unregistered UTXO itself before it can build
-      // the registration transaction; give its sync a bounded head start and
-      // throw into the retry loop if it never settles.
-      const deadline = Date.now() + 10 * 60 * 1_000;
-      while ((await session.dustStatus()).unregisteredUtxos === 0) {
-        if (Date.now() > deadline) {
-          throw new Error('Wallet never saw the unregistered NIGHT UTXO the indexer reports.');
+  start(): void {
+    const worker = new Worker(new URL('./wallet-worker.js', import.meta.url), {
+      workerData: { networkId: this.network.networkId },
+    });
+    this.worker = worker;
+    worker.on('message', (event: WorkerEvent) => {
+      if (event.type === 'state') {
+        this.state = event.state;
+        this.message = event.message;
+      } else if (event.type === 'claim') {
+        this.onClaim(event.claim);
+        if (event.claim.state === 'complete' || event.claim.state === 'failed') {
+          this.activeClaim = undefined;
         }
-        await sleep(RETRY_MS);
       }
-      await session.registerForDustGeneration((stage) => {
-        this.message = stage;
-        console.info(`[faucet:${this.network.networkId}] ${stage}`);
-      });
-    }
-
-    this.state = 'waiting_dust';
-    this.message = 'Faucet is waiting for transaction DUST…';
-    while ((await session.dustStatus()).balance <= 0n) await sleep(RETRY_MS);
-    this.state = 'ready';
-    this.message = 'Faucet is ready.';
-    console.info(`[faucet:${this.network.networkId}] ready`);
+    });
+    worker.on('error', (error) => {
+      console.error(`[faucet:${this.network.networkId}] wallet worker error`, error);
+    });
+    worker.on('exit', (code) => {
+      if (this.stopping) return;
+      this.state = 'error';
+      this.message = `Wallet worker exited (code ${code}); restarting…`;
+      console.error(`[faucet:${this.network.networkId}]`, this.message);
+      if (this.activeClaim) {
+        this.onClaim({
+          id: this.activeClaim,
+          network: this.network.networkId as NetworkId,
+          state: 'failed',
+          message: 'The faucet wallet restarted while preparing this transfer.',
+          createdAt: 0,
+        });
+        this.activeClaim = undefined;
+      }
+      setTimeout(() => this.start(), RETRY_MS).unref();
+    });
   }
 
   claim(claim: Claim, address: string): void {
-    if (this.state !== 'ready' || !this.session) throw new HttpError(503, this.message);
+    if (this.state !== 'ready' || !this.worker) throw new HttpError(503, this.message);
     if (this.activeClaim) throw new HttpError(429, 'This network is already preparing a transfer. Try again shortly.');
     this.activeClaim = claim.id;
     claim.state = 'queued';
     claim.message = 'Transfer queued…';
-    void this.send(claim, address);
+    const command: WorkerCommand = { type: 'claim', claim: { ...claim }, address };
+    this.worker.postMessage(command);
   }
 
-  private async send(claim: Claim, address: string): Promise<void> {
-    try {
-      claim.state = 'sending';
-      const result = await this.session!.sendUnshielded(address, CLAIM_STAR, (stage) => {
-        claim.message = stage;
-        console.info(`[faucet:${this.network.networkId}:${claim.id}] ${stage}`);
-      });
-      claim.state = 'complete';
-      claim.message = result.hash || result.identifier;
-    } catch (error) {
-      claim.state = 'failed';
-      claim.message = errorMessage(error);
-      console.error(`[faucet:${this.network.networkId}:${claim.id}]`, error);
-      this.state = 'syncing';
-      this.message = 'Faucet wallet is recovering from a rejected transaction…';
-      try {
-        await this.session!.resync();
-        this.state = 'ready';
-        this.message = 'Faucet is ready.';
-        console.info(`[faucet:${this.network.networkId}] wallet resynced after failed transfer`);
-      } catch (recoveryError) {
-        this.state = 'error';
-        this.message = `Wallet recovery failed: ${errorMessage(recoveryError)}`;
-        console.error(`[faucet:${this.network.networkId}]`, this.message);
-      }
-    } finally {
-      this.activeClaim = undefined;
-    }
+  async stop(): Promise<void> {
+    this.stopping = true;
+    const worker = this.worker;
+    if (!worker) return;
+    const exited = new Promise<void>((resolve) => worker.once('exit', () => resolve()));
+    worker.postMessage({ type: 'stop' } satisfies WorkerCommand);
+    await Promise.race([exited, sleep(10_000)]);
+    await worker.terminate().catch(() => undefined);
   }
 }
 
-class HttpError extends Error {
-  constructor(readonly status: number, message: string) {
-    super(message);
-  }
-}
-
-const wallets = Object.fromEntries(
-  Object.entries(NETWORKS).map(([id, network]) => [id, new FaucetWallet(network)]),
-) as Record<NetworkId, FaucetWallet>;
 const claims = new Map<string, Claim>();
+const wallets = Object.fromEntries(
+  Object.entries(NETWORKS).map(([id, network]) => [
+    id,
+    new WalletProxy(network, (update) => {
+      const claim = claims.get(update.id);
+      if (claim) {
+        claim.state = update.state;
+        claim.message = update.message;
+      }
+    }),
+  ]),
+) as Record<NetworkId, WalletProxy>;
 
 function json(response: ServerResponse, status: number, body: unknown): void {
   response.writeHead(status, {
@@ -271,7 +198,7 @@ const server = createServer((request, response) => {
 
 async function shutdown(): Promise<void> {
   server.close();
-  await Promise.all(Object.values(wallets).map((wallet) => wallet.session?.stop().catch(() => undefined)));
+  await Promise.all(Object.values(wallets).map((wallet) => wallet.stop().catch(() => undefined)));
   process.exit(0);
 }
 
