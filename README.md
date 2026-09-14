@@ -75,10 +75,13 @@ nightfrost \
 You can use `nightfrost snapshot` subcommands to create and load snapshots.
 
 ```sh
-nightfrost snapshot restore --trust-me-bro --data-dir /var/lib/nightfrost
+nightfrost --network-id preview snapshot restore --trust-me-bro --data-dir /var/lib/nightfrost
 ```
 
 We also support `--trust-me-bro` which will download our snapshots, don't trust us tho.
+
+The snapshot is picked by `--network-id` (or `NIGHTFROST_NETWORK_ID`), which
+defaults to `preview`; pass `mainnet` or `preprod` to restore those instead.
 
 ### Example clients
 
