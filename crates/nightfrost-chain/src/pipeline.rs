@@ -13,6 +13,7 @@ use async_stream::stream;
 use futures::{Stream, StreamExt, TryStreamExt, future::ok};
 use sha2::{Digest, Sha256};
 
+use nightfrost_core::metrics as m;
 use nightfrost_core::{
     domain::{
         LedgerEventAttributes, LedgerVersion, NetworkId, TransactionResult, TransactionVariant,
@@ -209,7 +210,7 @@ pub async fn run(
                 .await
                 .context("get next block from node")?
                 .context("finalized block stream ended")?;
-            stages.fetch += stage_start.elapsed();
+            stages.fetch += m::stage(&m::STAGE_FETCH_NANOS, stage_start.elapsed());
 
             // The genesis ledger state comes from the node's system properties.
             let genesis_ledger_state = if block.height == 0 {
@@ -225,6 +226,7 @@ pub async fn run(
 
             let height = block.height;
             let hash = block.hash;
+            let block_timestamp_ms = block.timestamp;
             let (next_state, new_key) = task::block_in_place(|| {
                 index_block(
                     &store,
@@ -269,8 +271,11 @@ pub async fn run(
             if caught_up || height.is_multiple_of(CATCH_UP_GC_INTERVAL) {
                 LedgerState::gc(GC_BOUND);
             }
-            stages.gc += stage_start.elapsed();
+            stages.gc += m::stage(&m::STAGE_GC_NANOS, stage_start.elapsed());
             stages.blocks += 1;
+            m::BLOCKS_INDEXED.inc();
+            m::LAST_BLOCK_INDEXED_UNIX_SECS.set(m::unix_now_secs());
+            m::LAST_BLOCK_CHAIN_UNIX_SECS.set(block_timestamp_ms / 1000);
             if caught_up || height % PROGRESS_LOG_INTERVAL == 0 {
                 tracing::info!(height, ?distance, caught_up, "block indexed");
             }
@@ -358,6 +363,7 @@ fn node_blocks(
                             expected = %expected,
                             "unexpected block, re-subscribing"
                         );
+                        m::RESUBSCRIBES.inc();
                         break;
                     }
                     highest_block = Some(BlockRef::from(block));
@@ -456,7 +462,7 @@ fn index_block(
     ledger_state
         .finalize_apply_transactions(block.timestamp)
         .context("finalize transaction application")?;
-    stages.replay += stage_start.elapsed();
+    stages.replay += m::stage(&m::STAGE_REPLAY_NANOS, stage_start.elapsed());
 
     // Post-block-0 genesis: the fresh state was only used to derive transaction
     // outcomes; the chain continues from the genesis state.
@@ -488,7 +494,7 @@ fn index_block(
             block.height
         );
     }
-    stages.roots += stage_start.elapsed();
+    stages.roots += m::stage(&m::STAGE_ROOTS_NANOS, stage_start.elapsed());
 
     // Persist the arena BEFORE the entity batch: on a crash in between, the arena
     // is at most one block ahead and the orphan root is bounded (mirrors the
@@ -496,12 +502,12 @@ fn index_block(
     let stage_start = Instant::now();
     let (ledger_state, ledger_state_key) =
         ledger_state.persist().context("persist ledger state")?;
-    stages.persist += stage_start.elapsed();
+    stages.persist += m::stage(&m::STAGE_PERSIST_NANOS, stage_start.elapsed());
 
     let stage_start = Instant::now();
     write_block(store, &block, derived, &ledger_state_key, window, ids)
         .context("write block batch")?;
-    stages.write += stage_start.elapsed();
+    stages.write += m::stage(&m::STAGE_WRITE_NANOS, stage_start.elapsed());
 
     Ok((ledger_state, ledger_state_key))
 }

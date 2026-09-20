@@ -39,6 +39,7 @@ fn env_var_name(key: &str) -> Option<&'static str> {
         "network_id" => "NIGHTFROST_NETWORK_ID",
         "data_dir" => "NIGHTFROST_DATA_DIR",
         "listen" => "NIGHTFROST_LISTEN",
+        "metrics_listen" => "NIGHTFROST_METRICS_LISTEN",
         "submit_cors_origin" => "NIGHTFROST_SUBMIT_CORS_ORIGIN",
         "cursor_secret" => "NIGHTFROST_CURSOR_SECRET",
         _ => return None,

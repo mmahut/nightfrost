@@ -67,7 +67,8 @@ nightfrost \
     --node-url wss://rpc.preview.midnight.network \
     --network-id preview \
     --data-dir /var/lib/nightfrost \
-    --listen 127.0.0.1:3000
+    --listen 127.0.0.1:3000 \
+    --metrics-listen 127.0.0.1:3001
 ```
 
 ### Snapshots

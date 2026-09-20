@@ -53,6 +53,10 @@ struct Args {
     )]
     listen: String,
 
+    /// Enable Prometheus metrics at this listen address (disabled when omitted)
+    #[arg(long, global = true, env = "NIGHTFROST_METRICS_LISTEN")]
+    metrics_listen: Option<String>,
+
     /// Exact browser origin allowed to submit transactions cross-origin.
     /// Leave unset for same-origin deployments.
     #[arg(long, global = true, env = "NIGHTFROST_SUBMIT_CORS_ORIGIN")]
@@ -176,6 +180,7 @@ async fn submit_tx(
     body: axum::body::Bytes,
 ) -> Result<axum::Json<serde_json::Value>, nightfrost_api::error::ApiError> {
     use nightfrost_api::error::ApiError;
+    use nightfrost_core::metrics::{TX_SUBMISSIONS_ACCEPTED, TX_SUBMISSIONS_REJECTED};
 
     let is_binary = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -185,21 +190,36 @@ async fn submit_tx(
     let raw = if is_binary {
         body.to_vec()
     } else {
-        let text = std::str::from_utf8(&body)
+        let parsed = std::str::from_utf8(&body)
             .map_err(|_| {
                 ApiError::bad_request(
                     "expected hex body (or Content-Type: application/octet-stream for raw bytes)",
                 )
-            })?
-            .trim();
-        let text = text.strip_prefix("0x").unwrap_or(text);
-        const_hex::decode(text).map_err(|_| ApiError::bad_request("invalid hex body"))?
+            })
+            .and_then(|text| {
+                let text = text.trim();
+                let text = text.strip_prefix("0x").unwrap_or(text);
+                const_hex::decode(text).map_err(|_| ApiError::bad_request("invalid hex body"))
+            });
+        match parsed {
+            Ok(raw) => raw,
+            Err(error) => {
+                TX_SUBMISSIONS_REJECTED.inc();
+                return Err(error);
+            }
+        }
     };
 
-    let hash = node
-        .submit_transaction(raw)
-        .await
-        .map_err(|error| ApiError::bad_request(format!("submission failed: {error:#}")))?;
+    let hash = match node.submit_transaction(raw).await {
+        Ok(hash) => hash,
+        Err(error) => {
+            TX_SUBMISSIONS_REJECTED.inc();
+            return Err(ApiError::bad_request(format!(
+                "submission failed: {error:#}"
+            )));
+        }
+    };
+    TX_SUBMISSIONS_ACCEPTED.inc();
 
     Ok(axum::Json(serde_json::json!({
         "tx_hash": const_hex::encode(hash)
@@ -391,28 +411,65 @@ async fn run(args: Args) -> anyhow::Result<()> {
     } else {
         submit_router
     };
-    let app = nightfrost_api::router(state).merge(submit_router);
+    let metrics_app = nightfrost_api::metrics_router(state.clone());
+    let app = nightfrost_api::router(state)
+        .merge(submit_router)
+        .layer(axum::middleware::from_fn(
+            nightfrost_api::metrics::track_http,
+        ));
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("bind {}", args.listen))?;
     tracing::info!(listen = %args.listen, "REST API listening");
 
-    let mut api = tokio::spawn(async move { axum::serve(listener, app).await });
+    let metrics_server = async {
+        let Some(address) = args.metrics_listen else {
+            return std::future::pending::<anyhow::Result<()>>().await;
+        };
+        let metrics_listener = tokio::net::TcpListener::bind(&address)
+            .await
+            .with_context(|| format!("bind metrics {address}"))?;
+        tracing::info!(listen = %address, "Prometheus metrics listening");
+        axum::serve(metrics_listener, metrics_app)
+            .await
+            .context("metrics server failed")
+    };
 
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut indexer => {
-            api.abort();
             // A root-match guard failure lands here: exit non-zero, loud.
             result.context("indexer panicked")?.context("indexer failed")
         }
-        result = &mut api => {
-            indexer.abort();
-            result.context("api panicked")?.context("api failed")
+        result = async { axum::serve(listener, app).await } => {
+            result.context("api failed")
         }
-        _ = tokio::signal::ctrl_c() => {
-            indexer.abort();
-            api.abort();
-            Ok(())
-        }
+        result = metrics_server => result,
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    };
+    indexer.abort();
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn metrics_require_an_explicit_address() {
+        // Ignore the developer's environment when checking the CLI default.
+        let command = Args::command().mut_arg("metrics_listen", |arg| arg.env(None::<&str>));
+        let defaults = command
+            .clone()
+            .try_get_matches_from(["nightfrost"])
+            .unwrap();
+        assert!(defaults.get_one::<String>("metrics_listen").is_none());
+        let enabled = command
+            .try_get_matches_from(["nightfrost", "--metrics-listen", "127.0.0.1:3001"])
+            .unwrap();
+        assert_eq!(
+            enabled.get_one::<String>("metrics_listen").unwrap(),
+            "127.0.0.1:3001"
+        );
     }
 }

@@ -15,6 +15,7 @@ pub fn run(config_path: &str, force: bool) -> anyhow::Result<()> {
     let node_url = prompt("Node URL", &default_node_url)?;
     let data_dir = prompt("Data directory", &format!("./data-{network}"))?;
     let listen = prompt("Listen address", "127.0.0.1:3000")?;
+    let metrics_listen = prompt("Metrics listen address (blank = disabled)", "")?;
     let cursor_secret = prompt("Cursor secret (blank = generate one)", "")?;
     let cursor_secret = if cursor_secret.is_empty() {
         generate_secret().context("generate cursor secret")?
@@ -22,13 +23,16 @@ pub fn run(config_path: &str, force: bool) -> anyhow::Result<()> {
         cursor_secret
     };
 
-    let contents = format!(
+    let mut contents = format!(
         "network_id = \"{network}\"\n\
          node_url = \"{node_url}\"\n\
          data_dir = \"{data_dir}\"\n\
          listen = \"{listen}\"\n\
          cursor_secret = \"{cursor_secret}\"\n"
     );
+    if !metrics_listen.is_empty() {
+        contents.push_str(&format!("metrics_listen = \"{metrics_listen}\"\n"));
+    }
     std::fs::write(config_path, contents).with_context(|| format!("write {config_path}"))?;
 
     println!("\nwrote {config_path} — run `nightfrost` to start.");

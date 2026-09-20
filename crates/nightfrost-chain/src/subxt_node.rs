@@ -399,6 +399,7 @@ impl SubxtNode {
                                 ?last_height,
                                 "received duplicate, possibly after reconnect"
                             );
+                            nightfrost_core::metrics::NODE_DUPLICATE_BLOCKS.inc();
                             false
                         } else {
                             last_height = Some(height);
@@ -413,10 +414,14 @@ impl SubxtNode {
                         )),
                     )) => {
                         warn!("node disconnected, reconnecting");
+                        nightfrost_core::metrics::NODE_RECONNECTS.inc();
                         false
                     }
 
-                    _ => true,
+                    Err(_) => {
+                        nightfrost_core::metrics::NODE_STREAM_ERRORS.inc();
+                        true
+                    }
                 };
 
                 ready(pass)
