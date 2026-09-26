@@ -107,7 +107,7 @@ Nightfrost calls used by the SDK adapter are:
 - `GET /api/v0/addresses/{address}/txs?from=...&order=asc`
 - `GET /api/v0/txs/{hash}`
 - `GET /api/v0/txs/{hash}/utxos`
-- `GET /api/v0/tx-identifiers/{identifier}`
+- `GET /api/v0/txs/identifiers/{identifier}`
 - `POST /api/v0/tx/submit`
 
 The first shielded sync submits the view-only encryption key once and receives only

@@ -1,0 +1,2350 @@
+openapi: 3.0.3
+info:
+  title: Midnight API
+  version: "0"
+  description: |
+    Instant REST API access to the Midnight blockchain.
+
+    Query blocks, transactions, addresses, contracts, DUST generation and a
+    raw ledger-event feed over plain REST. No API key, no signup required.
+
+    Successful JSON responses carry `results` plus the indexed chain tip at
+    the time the request was served, so a client can tell how fresh a
+    response is. `tip` is `null` only while nothing has been indexed yet:
+
+    ```json
+    { "results": { "...": "endpoint-specific payload" }, "tip": { "height": 291741, "hash": "6f1c...e2a9" } }
+    ```
+
+    `/txs/{hash}/raw` instead returns the stored transaction bytes as
+    `application/octet-stream`, without a JSON envelope. Its errors still
+    use the JSON error envelope below.
+
+    Indexed blocks and transaction inclusions are finalized. A transaction's
+    `status` describes its execution outcome, not pending/finalized status.
+
+    Paginated collection endpoints add a third field, `next_cursor`, present
+    (a string) while there's a further page and `null` once exhausted; pass
+    it back as the `cursor` query parameter to continue. Point lookups and
+    unpaginated full-list endpoints never include `next_cursor` at all, there
+    being no further page to fetch:
+
+    ```json
+    { "results": [{ "...": "..." }], "tip": { "height": 291741, "hash": "6f1c...e2a9" }, "next_cursor": "nf1.AQAA...Zg" }
+    ```
+
+    A cursor is bound to the chain tip it was issued at. If that tip has since
+    been rolled back by a reorg, the next page is a `410 Gone` and the client
+    restarts pagination without a cursor (see the `Gone` response).
+
+    Hashes, addresses, keys and other byte strings are hex-encoded without a
+    `0x` prefix everywhere the API emits them, with one exception: the byte
+    fields *inside* ledger event `attributes` (nullifiers, commitments, dust
+    owners and nonces, insertion paths) carry a `0x` prefix, because they are
+    serialized straight from the ledger's own types. Where the API *accepts*
+    hex (path parameters, request bodies), an optional `0x` prefix is
+    tolerated unless the parameter says otherwise.
+
+    Two numeric caveats for JavaScript clients: `value` and `initial_value`
+    inside dust event attributes are unsigned 128-bit JSON numbers, and
+    `generation_info.dtime` is `18446744073709551615` (u64::MAX) for "never
+    expires". Both exceed `Number.MAX_SAFE_INTEGER`; parse with a BigInt-aware
+    JSON parser if you need them exactly.
+
+    Errors use a flat envelope instead:
+
+    ```json
+    { "status_code": 404, "error": "Not Found", "message": "transaction not found" }
+    ```
+  license:
+    name: Apache-2.0
+    url: https://github.com/mmahut/nightfrost/blob/master/LICENSE
+
+security: []
+
+servers:
+  - url: https://mainnet.nightfrost.dev/api/v0
+    description: Mainnet
+  - url: https://preprod.nightfrost.dev/api/v0
+    description: Preprod
+  - url: https://preview.nightfrost.dev/api/v0
+    description: Preview
+
+tags:
+  - name: Network
+    description: Node identity, sync progress and aggregate counters.
+  - name: Blocks
+    description: Block lookups and the transactions in a block.
+  - name: Transactions
+    description: Transaction detail, its UTXOs, and its ledger events.
+  - name: Addresses
+    description: Unshielded balances, UTXOs, and transaction history for an address.
+  - name: Contracts
+    description: Contract state, balances, call history, and per-contract events.
+  - name: DUST
+    description: cNIGHT registrations and DUST generation status.
+  - name: Ledger events
+    description: A cursor-ordered feed of every ledger event, across all categories.
+  - name: Wallet sync
+    description: >
+      Purpose-built feeds for light wallets: a relevance-filtered shielded
+      bootstrap and a DUST-only replay.
+  - name: Submission
+    description: Submit a signed transaction to the network.
+
+paths:
+  /network:
+    get:
+      tags: [Network]
+      summary: Network identity
+      operationId: getNetwork
+      responses:
+        "200":
+          description: Network identity
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkEnvelope"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sync:
+    get:
+      tags: [Network]
+      summary: Indexer sync progress
+      operationId: getSyncStatus
+      description: >
+        `caught_up` is true once the indexed height is within 10 blocks of
+        the node's finalized tip. `percentage` is clamped to 100 for the
+        transient case of a node re-syncing below what's already indexed.
+      responses:
+        "200":
+          description: Sync progress
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncStatusEnvelope"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /stats:
+    get:
+      tags: [Network]
+      summary: Aggregate counters
+      operationId: getStats
+      responses:
+        "200":
+          description: Aggregate counters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsEnvelope"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /blocks/latest:
+    get:
+      tags: [Blocks]
+      summary: The most recently indexed block
+      operationId: getLatestBlock
+      responses:
+        "200":
+          description: Latest block
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlockEnvelope"
+        "404":
+          description: Nothing indexed yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /blocks/{id}:
+    get:
+      tags: [Blocks]
+      summary: A block by height or hash
+      operationId: getBlock
+      parameters:
+        - $ref: "#/components/parameters/BlockId"
+      responses:
+        "200":
+          description: Block
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlockEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /blocks/{id}/txs:
+    get:
+      tags: [Blocks]
+      summary: Transaction hashes included in a block
+      operationId: getBlockTransactions
+      parameters:
+        - $ref: "#/components/parameters/BlockId"
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Order"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Transaction hashes, in block order or its reverse depending on `order`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HashListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /ledger-parameters/latest:
+    get:
+      tags: [Blocks]
+      summary: Ledger parameters at the indexed tip
+      operationId: getLatestLedgerParameters
+      description: >
+        The authoritative ledger parameters in their tagged binary form, as
+        applied by the ledger at the indexed tip. Wallet clients need exactly
+        this encoding: fee calculation and transaction validation must use
+        the same parameters the ledger implementation does.
+      responses:
+        "200":
+          description: Ledger parameters, with the block they were read at
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LedgerParametersEnvelope"
+        "404":
+          description: Nothing indexed yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /txs/{hash}:
+    get:
+      tags: [Transactions]
+      summary: Transaction detail
+      operationId: getTransaction
+      description: >
+        If the same transaction hash was included more than once (possible
+        for system transactions), the most recent occurrence is returned.
+        Inclusion metadata is therefore not immutable. Use `/txs/{hash}/raw`
+        to download the serialized transaction without expanding this summary.
+      parameters:
+        - $ref: "#/components/parameters/TxHash"
+      responses:
+        "200":
+          description: Transaction
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /txs/{hash}/raw:
+    get:
+      tags: [Transactions]
+      summary: Download serialized transaction bytes
+      operationId: getRawTransaction
+      description: |
+        Returns the exact stored ledger bytes, without decoding or re-encoding,
+        for regular and system transactions in both supported ledger eras.
+        Like the transaction detail endpoint, selects the most recent indexed
+        occurrence when the hash occurs more than once.
+
+        No `results` or `tip` envelope is included. Read `/txs/{hash}` for the
+        transaction variant and containing block's `protocol_version`, then
+        use the corresponding ledger decoder. A system transaction uses the
+        system-transaction decoder, not the regular-transaction decoder.
+
+        The strong ETag is the quoted lowercase SHA-256 of the returned bytes,
+        computed from the payload rather than copied from the requested hash.
+        `Cache-Control: public, no-cache`
+        permits storage but requires revalidation; no immutable-cache promise
+        is made. `If-None-Match` supports lists, weak tags and `*`.
+        Missing or invalid hashes still return JSON errors, even when a
+        conditional header is supplied.
+      parameters:
+        - $ref: "#/components/parameters/TxHash"
+        - name: If-None-Match
+          in: header
+          schema:
+            type: string
+          description: Previously returned ETag, a list of ETags, or `*`.
+      responses:
+        "200":
+          description: Serialized ledger transaction
+          headers:
+            ETag:
+              description: Quoted lowercase SHA-256 of the exact response bytes.
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+                example: public, no-cache
+            Content-Length:
+              description: Byte length of the binary response body.
+              schema:
+                type: integer
+                format: int64
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "304":
+          description: The ETag matched; no response body. ETag and Cache-Control are returned.
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+                example: public, no-cache
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /txs/identifiers/{identifier}:
+    get:
+      tags: [Transactions]
+      summary: Transaction detail, looked up by ledger identifier
+      operationId: getTransactionByIdentifier
+      description: >
+        Resolves one of a transaction's `identifiers` (the 33-byte ledger
+        identifiers listed on the transaction itself) to the same payload as
+        `/txs/{hash}`. Wallets that only hold an identifier — e.g. from a
+        pending submission — use this to find the confirmed transaction.
+        If the identifier occurs more than once, the most recent occurrence
+        is returned. Follow the returned `hash` to `/txs/{hash}/raw` to
+        download the bytes.
+      parameters:
+        - name: identifier
+          in: path
+          required: true
+          description: 33-byte transaction identifier, hex-encoded (optional `0x` prefix).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Transaction
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /txs/{hash}/utxos:
+    get:
+      tags: [Transactions]
+      summary: Unshielded UTXOs consumed and produced by a transaction
+      operationId: getTransactionUtxos
+      parameters:
+        - $ref: "#/components/parameters/TxHash"
+      responses:
+        "200":
+          description: Transaction UTXOs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxUtxosEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /txs/{hash}/events:
+    get:
+      tags: [Transactions]
+      summary: Ledger events emitted by a transaction
+      operationId: getTransactionEvents
+      parameters:
+        - $ref: "#/components/parameters/TxHash"
+      responses:
+        "200":
+          description: Events emitted by the transaction, in emission order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxEventListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /addresses/{addr}:
+    get:
+      tags: [Addresses]
+      summary: Unshielded token balances for an address
+      operationId: getAddressBalances
+      description: >
+        An address that has never held anything is a 200 with an empty
+        list, not a 404.
+      parameters:
+        - $ref: "#/components/parameters/Address"
+      responses:
+        "200":
+          description: Balances, one entry per token type ever held
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalanceListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /addresses/{addr}/utxos:
+    get:
+      tags: [Addresses]
+      summary: Unspent UTXOs owned by an address
+      operationId: getAddressUtxos
+      description: >
+        Current-state pagination: reflects the unspent set at request time,
+        not a tip-consistent snapshot.
+      parameters:
+        - $ref: "#/components/parameters/Address"
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Order"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Unspent UTXOs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UtxoListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /addresses/{addr}/utxos/{token_type}:
+    get:
+      tags: [Addresses]
+      summary: Unspent UTXOs owned by an address, filtered to one token type
+      operationId: getAddressUtxosByToken
+      description: >
+        Current-state pagination: reflects the unspent set at request time,
+        not a tip-consistent snapshot.
+      parameters:
+        - $ref: "#/components/parameters/Address"
+        - name: token_type
+          in: path
+          required: true
+          description: 32-byte token type identifier, hex-encoded.
+          schema:
+            type: string
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Order"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Unspent UTXOs of the given token type
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UtxoListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /addresses/{addr}/txs:
+    get:
+      tags: [Addresses]
+      summary: Transaction hashes touching an address
+      operationId: getAddressTransactions
+      description: >
+        Ordered by global transaction id (`Tx.id`), which is chain order.
+        Tip-anchored: a page never includes transactions from blocks above
+        the tip the cursor sequence started at.
+      parameters:
+        - $ref: "#/components/parameters/Address"
+        - name: from
+          in: query
+          description: >
+            Skip transactions with a global transaction id (`Tx.id`) below
+            this. Lets a client resume from where its last full scan ended
+            without holding a cursor.
+          schema:
+            type: integer
+            format: uint64
+            default: 0
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Order"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Transaction hashes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HashListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /contracts:
+    get:
+      tags: [Contracts]
+      summary: All deployed contracts
+      operationId: getContracts
+      description: >
+        Current-state pagination: reflects the contract set at request time,
+        not a tip-consistent snapshot.
+      parameters:
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Order"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Contracts, ordered by address
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /contracts/{addr}:
+    get:
+      tags: [Contracts]
+      summary: Contract summary
+      operationId: getContract
+      description: >
+        Cheap to poll: `state_hash` changes exactly when the contract's state
+        does, so a client can watch this endpoint and fetch
+        `/contracts/{addr}/state` only when the hash moves.
+      parameters:
+        - $ref: "#/components/parameters/ContractAddress"
+      responses:
+        "200":
+          description: Contract summary, including its latest balances
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /contracts/{addr}/state:
+    get:
+      tags: [Contracts]
+      summary: Latest raw contract state
+      operationId: getContractState
+      parameters:
+        - $ref: "#/components/parameters/ContractAddress"
+      responses:
+        "200":
+          description: Latest contract state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractStateEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /contracts/{addr}/actions:
+    get:
+      tags: [Contracts]
+      summary: Deploy, call and update history for a contract
+      operationId: getContractActions
+      description: >
+        Tip-anchored: a page never includes actions from blocks above the tip
+        the cursor sequence started at.
+      parameters:
+        - $ref: "#/components/parameters/ContractAddress"
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Order"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Contract actions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractActionListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /contracts/{addr}/events:
+    get:
+      tags: [Contracts]
+      summary: Ledger events emitted by a contract
+      operationId: getContractEvents
+      description: >
+        Tip-anchored: a page never includes events from blocks above the tip
+        the cursor sequence started at.
+      parameters:
+        - $ref: "#/components/parameters/ContractAddress"
+        - name: from
+          in: query
+          description: Skip ledger events before this global event id.
+          schema:
+            type: integer
+            format: uint64
+            default: 0
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Order"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Events emitted by this contract
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractEventListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /dust/registrations:
+    get:
+      tags: [DUST]
+      summary: All cNIGHT to DUST address registrations
+      operationId: getDustRegistrations
+      description: >
+        Current-state pagination: reflects the latest known state of each
+        registration at request time, not a tip-consistent snapshot.
+      parameters:
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Order"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Registrations
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegistrationListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /dust/registrations/{stake_key}:
+    get:
+      tags: [DUST]
+      summary: Registrations for one Cardano stake key
+      operationId: getDustRegistrationsByStake
+      description: >
+        Current-state pagination, like `/dust/registrations`. A stake key
+        with no registrations is a 200 with an empty list.
+      parameters:
+        - $ref: "#/components/parameters/StakeKey"
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Order"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Registrations for this stake key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegistrationListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /dust/status/{stake_key}:
+    get:
+      tags: [DUST]
+      summary: DUST generation status for a Cardano stake key
+      operationId: getDustGenerationStatus
+      description: >
+        Unregistered keys are a 200 with `registered: false`, matching the
+        official Midnight indexer rather than a 404. Capacities are computed
+        as of the latest indexed block's timestamp.
+      parameters:
+        - $ref: "#/components/parameters/StakeKey"
+      responses:
+        "200":
+          description: Generation status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DustGenerationStatusEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /ledger/events:
+    get:
+      tags: [Ledger events]
+      summary: Every ledger event, across zswap, DUST and contract categories
+      operationId: getLedgerEvents
+      description: >
+        Tip-anchored: a page never includes events from blocks above the tip
+        the cursor sequence started at.
+      parameters:
+        - name: from
+          in: query
+          description: Skip events before this global event id.
+          schema:
+            type: integer
+            format: uint64
+            default: 0
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Order"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Ledger events
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /wallet/events:
+    post:
+      tags: [Ledger events]
+      summary: Wallet-ready Zswap and DUST event feed
+      operationId: getWalletEvents
+      description: >
+        Stateless trial decryption using the supplied view-only Zswap encryption
+        secret key. The key is used only for this request and is not persisted.
+        Returns every DUST and Zswap event so wallet Merkle replay stays complete;
+        Zswap events are annotated with trial-decryption relevance and contract
+        events are omitted. Progress advances by raw events scanned, so
+        an empty result can still move `scanned_through` forward.
+
+        Always ascending by event id; there is no `order` option. Cursor
+        pagination works as on the GET collections (the cursor is carried in
+        the body instead of the query string) and is tip-anchored. The body is
+        limited to 4 KiB.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WalletEventsRequest"
+      responses:
+        "200":
+          description: Filtered wallet events and raw scan progress
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletEventsEnvelope"
+        "400":
+          description: >
+            Invalid `viewing_key` (not hex, or neither a raw 32-byte key nor
+            the official SDK serialization), `count` out of range, or a bad
+            cursor — see the generic `Bad Request` response for the cursor
+            cases.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /wallet-sync/shielded:
+    post:
+      tags: [Wallet sync]
+      summary: Relevance-filtered shielded wallet bootstrap
+      operationId: walletSyncShielded
+      description: |
+        Fast shielded-wallet sync: only the Zswap events of transactions
+        relevant to the supplied viewing key cross the wire, and every
+        irrelevant gap in the Zswap commitment tree is covered by a compact,
+        authenticated collapsed Merkle update. Applying the `updates` in order
+        from `from_index` brings a wallet's local tree to `highest_index`.
+
+        The viewing key is used for trial decryption; relevance results are
+        cached server-side under a hash of the key so repeat syncs are cheap,
+        but the key itself is never persisted. Requests for a key that hasn't
+        been scanned before block while the chain is scanned, which can take
+        a while on a long chain.
+
+        Not paginated: the response covers everything from `from_index` to
+        the indexed tip. `from_index` must sit on a transaction boundary the
+        wallet has fully applied — a `from_index` inside a relevant
+        transaction's range of tree indices is a 400. The body is limited to
+        4 KiB.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ShieldedSyncRequest"
+      responses:
+        "200":
+          description: Ordered Merkle updates from `from_index` to the tip
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ShieldedSyncEnvelope"
+        "400":
+          description: >
+            Invalid `viewing_key`, `from_index` beyond the end of the Zswap
+            tree, or `from_index` falling inside a relevant transaction.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /wallet-sync/dust:
+    get:
+      tags: [Wallet sync]
+      summary: DUST-only event replay feed
+      operationId: walletSyncDust
+      description: |
+        Every DUST ledger event from `from` onwards, in event-id order, read
+        from a dedicated side index so a wallet replaying its DUST state never
+        has to skip over Zswap or contract events. No key is needed: DUST
+        events aren't encrypted.
+
+        Not cursor-paginated. Resume by passing the returned
+        `scanned_through` as the next `from`; once fewer than `count` events
+        come back the feed is caught up and `scanned_through` equals
+        `highest_event_id`. Responses are shared-cacheable for two seconds.
+      parameters:
+        - name: from
+          in: query
+          description: Skip events before this global event id.
+          schema:
+            type: integer
+            format: uint64
+            default: 0
+        - name: count
+          in: query
+          description: Maximum number of events to return.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50000
+            default: 5000
+      responses:
+        "200":
+          description: DUST events and replay progress
+          headers:
+            Cache-Control:
+              description: Always `public, max-age=2`.
+              schema:
+                type: string
+                example: public, max-age=2
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DustSyncEnvelope"
+        "400":
+          description: >
+            `count` outside 1–50000, or a `from`/`count` that isn't an
+            integer.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /tx/submit:
+    post:
+      tags: [Submission]
+      summary: Submit a signed transaction
+      operationId: submitTransaction
+      description: >
+        The body is the raw ledger transaction, hex-encoded (optionally
+        `0x`-prefixed) by default, or raw bytes when `Content-Type:
+        application/octet-stream` is set. Proxied to the node as an unsigned
+        `Midnight.send_mn_transaction` extrinsic; the transaction itself must
+        already be fully signed and proven. Bodies over 2 MiB are rejected.
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+              example: "1a2b3c..."
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Accepted by the node
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tx_hash:
+                    type: string
+                    description: 32-byte transaction hash, hex-encoded.
+                required: [tx_hash]
+        "400":
+          description: >
+            Malformed body (not UTF-8, not hex), or the node rejected the
+            transaction; the node's reason is in `message`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+
+  # Served at the host root, not under /api/v0, so the path-level servers
+  # override the document-wide base URL.
+components:
+  parameters:
+    BlockId:
+      name: id
+      in: path
+      required: true
+      description: Decimal block height, or 32-byte block hash (hex).
+      schema:
+        type: string
+      example: "291741"
+    TxHash:
+      name: hash
+      in: path
+      required: true
+      description: 32-byte transaction hash, hex-encoded.
+      schema:
+        type: string
+    Address:
+      name: addr
+      in: path
+      required: true
+      description: 32-byte unshielded address, hex or bech32m (`mn_addr...`).
+      schema:
+        type: string
+    ContractAddress:
+      name: addr
+      in: path
+      required: true
+      description: Contract address, hex-encoded.
+      schema:
+        type: string
+    StakeKey:
+      name: stake_key
+      in: path
+      required: true
+      description: >
+        Cardano stake key (reward address): 29 bytes hex-encoded, or bech32
+        (`stake1...` / `stake_test1...`).
+      schema:
+        type: string
+    Count:
+      name: count
+      in: query
+      description: Page size.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 5000
+        default: 100
+    Order:
+      name: order
+      in: query
+      description: Sort direction.
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: asc
+    Cursor:
+      name: cursor
+      in: query
+      description: >
+        Opaque pagination token from a previous response's `next_cursor`.
+        Bound to the exact same query (path, filters and order) it was issued
+        for, and to the chain tip at the time of the first request in the
+        sequence. At most 1024 bytes.
+      schema:
+        type: string
+
+  headers:
+    CacheControlNoStore:
+      description: Always `no-store`; the response is derived from a secret in the request.
+      schema:
+        type: string
+        example: no-store
+
+  responses:
+    BadRequest:
+      description: >
+        Malformed request. Covers a path parameter that doesn't parse (wrong
+        length, not hex/bech32), `count` outside 1–5000, a cursor that is
+        longer than 1024 bytes, tampered with, or issued for a different
+        query, and the retired offset-pagination parameter: any request
+        carrying `page` is rejected with `"querystring page is no longer
+        supported; use next_cursor as cursor"`. Query strings that fail to
+        deserialize at all (e.g. `count=abc`, `order=sideways`) and bodies
+        that aren't valid JSON are rejected by the framework before the
+        handler runs and come back as a plain-text 400 (or 415/422 for a
+        missing content type or a JSON body of the wrong shape) rather than
+        the JSON error envelope.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            status_code: 400
+            error: Bad Request
+            message: querystring count should be within range 1-5000
+        text/plain:
+          schema:
+            type: string
+          example: "Failed to deserialize query string: invalid digit found in string"
+    NotFound:
+      description: No such resource
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Gone:
+      description: >
+        The cursor's anchor tip has been reorged away. Every cursor is bound to
+        the block the first request in the sequence was served at; before a
+        later page is served that block is looked up again. `"cursor tip is no
+        longer available"` means the anchor height is no longer indexed (the
+        chain was rolled back below it); `"cursor belongs to a different chain
+        history"` means a block at that height exists but with a different
+        hash — the tip the client was paging through is no longer canonical.
+        Either way the pages already fetched may describe a history the chain
+        has abandoned: discard them and restart pagination from the first
+        page without a `cursor`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            status_code: 410
+            error: Gone
+            message: cursor belongs to a different chain history
+    PayloadTooLarge:
+      description: >
+        Request body over the endpoint's limit (4 KiB for the wallet POSTs,
+        2 MiB for `/tx/submit`). Emitted by the framework as plain text, not
+        the JSON error envelope.
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: length limit exceeded
+    InternalError:
+      description: >
+        The indexer hit an inconsistency it can't serve around (a referenced
+        record missing from the store, a ledger state that failed to load).
+        Nothing the client did; retry later or report it.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            status_code: 500
+            error: Internal Server Error
+            message: missing tx record
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        status_code:
+          type: integer
+        error:
+          type: string
+        message:
+          type: string
+      required: [status_code, error, message]
+
+    Hex:
+      type: string
+      description: Bytes, hex-encoded without a `0x` prefix.
+      pattern: "^([0-9a-f]{2})*$"
+
+    Hex0x:
+      type: string
+      description: >-
+        Bytes, hex-encoded **with** a `0x` prefix. Used inside ledger event
+        attributes, which are serialized straight from the ledger's byte
+        types; everything else in the API emits bare hex (`Hex`).
+      pattern: "^0x([0-9a-f]{2})*$"
+
+    Tip:
+      type: object
+      nullable: true
+      description: Null only while nothing has been indexed yet.
+      properties:
+        height:
+          type: integer
+          format: uint64
+        hash:
+          type: string
+      required: [height, hash]
+
+    Network:
+      type: object
+      properties:
+        network_id:
+          type: string
+          example: mainnet
+        node_url:
+          type: string
+        genesis_hash:
+          type: string
+          nullable: true
+      required: [network_id, node_url]
+    NetworkEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/Network"
+
+    SyncStatus:
+      type: object
+      properties:
+        indexed_height:
+          type: integer
+          format: uint64
+          nullable: true
+        node_height:
+          type: integer
+          format: uint64
+          nullable: true
+        percentage:
+          type: number
+          nullable: true
+          description: Indexed height as a percentage of the node height, two decimals, clamped to 100.
+        caught_up:
+          type: boolean
+      required: [indexed_height, node_height, percentage, caught_up]
+    SyncStatusEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/SyncStatus"
+
+    Stats:
+      type: object
+      properties:
+        total_transactions:
+          type: integer
+          format: uint64
+        total_contract_actions:
+          type: integer
+          format: uint64
+        total_ledger_events:
+          type: integer
+          format: uint64
+        total_contracts:
+          type: integer
+          format: uint64
+      required: [total_transactions, total_contract_actions, total_ledger_events, total_contracts]
+    StatsEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/Stats"
+
+    Block:
+      type: object
+      properties:
+        hash:
+          type: string
+        height:
+          type: integer
+          format: uint64
+        parent_hash:
+          type: string
+        timestamp:
+          type: integer
+          format: uint64
+          description: Unix milliseconds.
+        protocol_version:
+          type: integer
+        author:
+          type: string
+          nullable: true
+          description: Null for the genesis block.
+        tx_count:
+          type: integer
+        zswap_merkle_tree_root:
+          type: string
+        ledger_state_root:
+          type: string
+          nullable: true
+      required:
+        - hash
+        - height
+        - parent_hash
+        - timestamp
+        - protocol_version
+        - author
+        - tx_count
+        - zswap_merkle_tree_root
+        - ledger_state_root
+    BlockEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/Block"
+
+    LedgerParameters:
+      type: object
+      properties:
+        block_hash:
+          type: string
+          description: The indexed tip the parameters were read from.
+        block_height:
+          type: integer
+          format: uint64
+        block_time:
+          type: integer
+          format: uint64
+          description: Unix milliseconds.
+        protocol_version:
+          type: integer
+          description: Protocol version of that block, which selects the ledger version the encoding belongs to.
+        ledger_parameters:
+          $ref: "#/components/schemas/Hex"
+      required: [block_hash, block_height, block_time, protocol_version, ledger_parameters]
+    LedgerParametersEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/LedgerParameters"
+
+    Tx:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: uint64
+          description: >
+            Global transaction id: dense, chain-ordered, and the `from` bound
+            for `/addresses/{addr}/txs`. Also what `Event.tx_id` refers to.
+        hash:
+          type: string
+        block_height:
+          type: integer
+          format: uint64
+        block_hash:
+          type: string
+        block_time:
+          type: integer
+          format: uint64
+          description: Unix milliseconds.
+        block_author:
+          type: string
+          nullable: true
+          description: Hex-encoded block author, or null when unavailable (including genesis).
+        index:
+          type: integer
+          description: Position of the transaction within its block.
+        protocol_version:
+          type: integer
+          description: Protocol version of the containing block.
+        variant:
+          type: string
+          enum: [Regular, System]
+        status:
+          type: string
+          enum: [success, partial_success, failure]
+        segments:
+          type: array
+          nullable: true
+          description: >
+            Present only when status is partial_success: `[segment_id,
+            succeeded]` pairs.
+          items:
+            type: array
+            items: {}
+            minItems: 2
+            maxItems: 2
+        paid_fees:
+          type: string
+          description: u128, as a decimal string.
+        estimated_fees:
+          type: string
+        identifiers:
+          type: array
+          description: >
+            33-byte ledger identifiers, hex-encoded; each resolves via
+            `/txs/identifiers/{identifier}`. They include shielded-offer and
+            intent commitments, and are not a positional mapping to contract
+            actions. Multiple actions may belong to one intent. No action-to-
+            identifier correspondence should be inferred from array order.
+          items:
+            type: string
+        utxo_created_count:
+          type: integer
+        utxo_spent_count:
+          type: integer
+        event_count:
+          type: integer
+        contract_action_count:
+          type: integer
+      required:
+        - id
+        - hash
+        - block_height
+        - block_hash
+        - block_time
+        - block_author
+        - index
+        - protocol_version
+        - variant
+        - status
+        - segments
+        - paid_fees
+        - estimated_fees
+        - identifiers
+        - utxo_created_count
+        - utxo_spent_count
+        - event_count
+        - contract_action_count
+    TxEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/Tx"
+
+    Utxo:
+      type: object
+      properties:
+        owner:
+          type: string
+        token_type:
+          type: string
+        value:
+          type: string
+          description: u128, as a decimal string.
+        intent_hash:
+          type: string
+        output_index:
+          type: integer
+        ctime:
+          type: integer
+          format: uint64
+          nullable: true
+        registered_for_dust_generation:
+          type: boolean
+      required:
+        - owner
+        - token_type
+        - value
+        - intent_hash
+        - output_index
+        - ctime
+        - registered_for_dust_generation
+    TxUtxos:
+      type: object
+      properties:
+        hash:
+          type: string
+        inputs:
+          type: array
+          items:
+            $ref: "#/components/schemas/Utxo"
+        outputs:
+          type: array
+          items:
+            $ref: "#/components/schemas/Utxo"
+      required: [hash, inputs, outputs]
+    TxUtxosEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/TxUtxos"
+    UtxoListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            results:
+              type: array
+              items:
+                $ref: "#/components/schemas/Utxo"
+
+    # The fields every event surface shares. `Event` adds protocol_version;
+    # `ContractEvent` adds its correlation context but not protocol_version.
+    EventBase:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: uint64
+          description: Global event id, dense and chain-ordered.
+        grouping:
+          type: string
+          enum: [Zswap, Dust, Contract]
+        attributes:
+          $ref: "#/components/schemas/LedgerEventAttributes"
+        raw:
+          type: string
+          description: The raw encoded event, hex-encoded.
+        tx_id:
+          type: integer
+          format: uint64
+          description: The emitting transaction's `Tx.id`.
+        block_height:
+          type: integer
+          format: uint64
+      required: [id, grouping, attributes, raw, tx_id, block_height]
+    Event:
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          properties:
+            protocol_version:
+              type: integer
+              description: Protocol version of the containing block; selects the ledger version `raw` is encoded under.
+          required: [protocol_version]
+    TxEventListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              type: array
+              items:
+                $ref: "#/components/schemas/Event"
+    EventListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            results:
+              type: array
+              items:
+                $ref: "#/components/schemas/Event"
+
+    # Serde's default externally-tagged enum encoding: unit variants are bare
+    # strings, struct variants are a single-key object whose key is the
+    # variant name. Byte fields are hex strings; the DUST structs carry u128
+    # values as JSON numbers, not the decimal strings used elsewhere.
+    LedgerEventAttributes:
+      description: >
+        Decoded event payload, one shape per ledger event kind. `ZswapOutput`
+        and `ParamChange` carry no fields and are serialized as bare strings;
+        every other kind is an object with exactly one key, the variant name.
+        Fall back to `raw` for anything a shape doesn't surface.
+      oneOf:
+        - title: Unit variant
+          type: string
+          enum: [ZswapOutput, ParamChange]
+        - title: ZswapInput
+          type: object
+          properties:
+            ZswapInput:
+              type: object
+              properties:
+                nullifier:
+                  $ref: "#/components/schemas/Hex0x"
+              required: [nullifier]
+          required: [ZswapInput]
+          additionalProperties: false
+        - title: DustInitialUtxo
+          type: object
+          properties:
+            DustInitialUtxo:
+              type: object
+              properties:
+                output:
+                  $ref: "#/components/schemas/QualifiedDustOutput"
+                generation_info:
+                  $ref: "#/components/schemas/DustGenerationInfo"
+                generation_index:
+                  type: integer
+                  format: uint64
+              required: [output, generation_info, generation_index]
+          required: [DustInitialUtxo]
+          additionalProperties: false
+        - title: DustGenerationDtimeUpdate
+          type: object
+          properties:
+            DustGenerationDtimeUpdate:
+              type: object
+              properties:
+                generation_info:
+                  $ref: "#/components/schemas/DustGenerationInfo"
+                generation_index:
+                  type: integer
+                  format: uint64
+                tree_insertion_path:
+                  allOf:
+                    - $ref: "#/components/schemas/Hex0x"
+                  description: >
+                    Tagged-serialized `TreeInsertionPath<DustGenerationInfo>`
+                    from the originating ledger event, verbatim, for
+                    `generating_tree.update_from_evidence(...)`.
+              required: [generation_info, generation_index, tree_insertion_path]
+          required: [DustGenerationDtimeUpdate]
+          additionalProperties: false
+        - title: DustSpendProcessed
+          type: object
+          properties:
+            DustSpendProcessed:
+              type: object
+              properties:
+                nullifier:
+                  $ref: "#/components/schemas/Hex0x"
+                commitment:
+                  $ref: "#/components/schemas/Hex0x"
+              required: [nullifier, commitment]
+          required: [DustSpendProcessed]
+          additionalProperties: false
+        - title: ContractShieldedSpend
+          type: object
+          properties:
+            ContractShieldedSpend:
+              type: object
+              properties:
+                version:
+                  type: integer
+                entry_point:
+                  $ref: "#/components/schemas/Hex0x"
+                nullifier:
+                  $ref: "#/components/schemas/Hex0x"
+              required: [version, entry_point, nullifier]
+          required: [ContractShieldedSpend]
+          additionalProperties: false
+        - title: ContractShieldedReceive
+          type: object
+          properties:
+            ContractShieldedReceive:
+              type: object
+              properties:
+                version:
+                  type: integer
+                entry_point:
+                  $ref: "#/components/schemas/Hex0x"
+                commitment:
+                  $ref: "#/components/schemas/Hex0x"
+                ciphertext:
+                  type: string
+                  nullable: true
+                  description: Hex-encoded bytes with a `0x` prefix.
+                receiving_contract_address:
+                  type: string
+                  nullable: true
+                  description: Hex-encoded bytes with a `0x` prefix.
+              required: [version, entry_point, commitment, ciphertext, receiving_contract_address]
+          required: [ContractShieldedReceive]
+          additionalProperties: false
+        - title: ContractShieldedMint
+          type: object
+          properties:
+            ContractShieldedMint:
+              type: object
+              properties:
+                version:
+                  type: integer
+                entry_point:
+                  $ref: "#/components/schemas/Hex0x"
+                commitment:
+                  $ref: "#/components/schemas/Hex0x"
+                domain_sep:
+                  $ref: "#/components/schemas/Hex0x"
+                amount:
+                  type: string
+                  nullable: true
+                  description: Decimal string.
+              required: [version, entry_point, commitment, domain_sep, amount]
+          required: [ContractShieldedMint]
+          additionalProperties: false
+        - title: ContractShieldedBurn
+          type: object
+          properties:
+            ContractShieldedBurn:
+              type: object
+              properties:
+                version:
+                  type: integer
+                entry_point:
+                  $ref: "#/components/schemas/Hex0x"
+                nullifier:
+                  $ref: "#/components/schemas/Hex0x"
+                amount:
+                  type: string
+                  nullable: true
+                  description: Decimal string.
+              required: [version, entry_point, nullifier, amount]
+          required: [ContractShieldedBurn]
+          additionalProperties: false
+        - title: ContractUnshieldedSpend
+          type: object
+          properties:
+            ContractUnshieldedSpend:
+              type: object
+              properties:
+                version:
+                  type: integer
+                entry_point:
+                  $ref: "#/components/schemas/Hex0x"
+                sender:
+                  $ref: "#/components/schemas/AddressOrContract"
+                domain_sep:
+                  $ref: "#/components/schemas/Hex0x"
+                token_type:
+                  $ref: "#/components/schemas/Hex0x"
+                amount:
+                  type: string
+                  description: Decimal string.
+              required: [version, entry_point, sender, domain_sep, token_type, amount]
+          required: [ContractUnshieldedSpend]
+          additionalProperties: false
+        - title: ContractUnshieldedReceive
+          type: object
+          properties:
+            ContractUnshieldedReceive:
+              type: object
+              properties:
+                version:
+                  type: integer
+                entry_point:
+                  $ref: "#/components/schemas/Hex0x"
+                recipient:
+                  $ref: "#/components/schemas/AddressOrContract"
+                domain_sep:
+                  $ref: "#/components/schemas/Hex0x"
+                token_type:
+                  $ref: "#/components/schemas/Hex0x"
+                amount:
+                  type: string
+                  description: Decimal string.
+              required: [version, entry_point, recipient, domain_sep, token_type, amount]
+          required: [ContractUnshieldedReceive]
+          additionalProperties: false
+        - title: ContractUnshieldedMint
+          type: object
+          properties:
+            ContractUnshieldedMint:
+              type: object
+              properties:
+                version:
+                  type: integer
+                entry_point:
+                  $ref: "#/components/schemas/Hex0x"
+                domain_sep:
+                  $ref: "#/components/schemas/Hex0x"
+                token_type:
+                  $ref: "#/components/schemas/Hex0x"
+                amount:
+                  type: string
+                  description: Decimal string.
+              required: [version, entry_point, domain_sep, token_type, amount]
+          required: [ContractUnshieldedMint]
+          additionalProperties: false
+        - title: ContractUnshieldedBurn
+          type: object
+          properties:
+            ContractUnshieldedBurn:
+              type: object
+              properties:
+                version:
+                  type: integer
+                entry_point:
+                  $ref: "#/components/schemas/Hex0x"
+                sender:
+                  $ref: "#/components/schemas/AddressOrContract"
+                token_type:
+                  $ref: "#/components/schemas/Hex0x"
+                amount:
+                  type: string
+                  description: Decimal string.
+              required: [version, entry_point, sender, token_type, amount]
+          required: [ContractUnshieldedBurn]
+          additionalProperties: false
+        - title: ContractPaused
+          type: object
+          properties:
+            ContractPaused:
+              type: object
+              properties:
+                version:
+                  type: integer
+                entry_point:
+                  $ref: "#/components/schemas/Hex0x"
+              required: [version, entry_point]
+          required: [ContractPaused]
+          additionalProperties: false
+        - title: ContractUnpaused
+          type: object
+          properties:
+            ContractUnpaused:
+              type: object
+              properties:
+                version:
+                  type: integer
+                entry_point:
+                  $ref: "#/components/schemas/Hex0x"
+              required: [version, entry_point]
+          required: [ContractUnpaused]
+          additionalProperties: false
+        - title: ContractMisc
+          type: object
+          properties:
+            ContractMisc:
+              type: object
+              properties:
+                version:
+                  type: integer
+                entry_point:
+                  $ref: "#/components/schemas/Hex0x"
+                name:
+                  $ref: "#/components/schemas/Hex0x"
+                payload:
+                  $ref: "#/components/schemas/Hex0x"
+              required: [version, entry_point, name, payload]
+          required: [ContractMisc]
+          additionalProperties: false
+      example:
+        ZswapInput:
+          nullifier: "0x3f9a1c0d5b7e2a8f4c6d1e0b9a8f7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b"
+
+    AddressOrContract:
+      description: >
+        Either a user's Zswap coin public key or a contract address; a
+        single-key object tagged with which.
+      oneOf:
+        - title: User
+          type: object
+          properties:
+            User:
+              $ref: "#/components/schemas/Hex0x"
+          required: [User]
+          additionalProperties: false
+        - title: Contract
+          type: object
+          properties:
+            Contract:
+              $ref: "#/components/schemas/Hex0x"
+          required: [Contract]
+          additionalProperties: false
+
+    QualifiedDustOutput:
+      type: object
+      properties:
+        initial_value:
+          type: integer
+          format: uint128
+          description: Initial DUST value in SPECK, as a JSON number (may exceed 2^53).
+        owner:
+          allOf:
+            - $ref: "#/components/schemas/Hex0x"
+          description: Owner's DUST public key.
+        nonce:
+          $ref: "#/components/schemas/Hex0x"
+        seq:
+          type: integer
+        ctime:
+          type: integer
+          format: uint64
+          description: Creation time, Unix seconds.
+        backing_night:
+          allOf:
+            - $ref: "#/components/schemas/Hex0x"
+          description: Nonce of the backing NIGHT UTXO.
+        mt_index:
+          type: integer
+          format: uint64
+          description: Index in the DUST commitment Merkle tree.
+      required: [initial_value, owner, nonce, seq, ctime, backing_night, mt_index]
+
+    DustGenerationInfo:
+      type: object
+      properties:
+        night_utxo_hash:
+          allOf:
+            - $ref: "#/components/schemas/Hex0x"
+          description: Hash of the backing NIGHT UTXO.
+        value:
+          type: integer
+          format: uint128
+          description: Value of the backing NIGHT UTXO in STAR, as a JSON number (may exceed 2^53).
+        owner:
+          allOf:
+            - $ref: "#/components/schemas/Hex0x"
+          description: Owner's DUST public key.
+        nonce:
+          $ref: "#/components/schemas/Hex0x"
+        ctime:
+          type: integer
+          format: uint64
+          description: Creation time, Unix seconds.
+        dtime:
+          type: integer
+          format: uint64
+          description: >-
+            Decay time (when the backing NIGHT was spent), Unix seconds;
+            `18446744073709551615` (u64::MAX) while still generating. That
+            value exceeds the JavaScript safe-integer range.
+      required: [night_utxo_hash, value, owner, nonce, ctime, dtime]
+
+    WalletEventsRequest:
+      type: object
+      properties:
+        viewing_key:
+          type: string
+          description: Raw 32-byte Zswap key or official SDK serialization, hex-encoded (optional `0x` prefix).
+        from:
+          type: integer
+          format: uint64
+          default: 0
+          description: Skip events before this global event id.
+        count:
+          type: integer
+          minimum: 1
+          maximum: 5000
+          default: 5000
+          description: Maximum number of raw events to scan per request (not events returned).
+        cursor:
+          type: string
+          nullable: true
+          description: "`next_cursor` from the previous response; same semantics as the `cursor` query parameter."
+      required: [viewing_key]
+    WalletEvent:
+      allOf:
+        - $ref: "#/components/schemas/Event"
+        - type: object
+          properties:
+            relevant:
+              type: boolean
+              nullable: true
+              description: Trial-decryption result for Zswap; null for DUST.
+          required: [relevant]
+
+    WalletEventsResult:
+      type: object
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/WalletEvent"
+        scanned_through:
+          type: integer
+          format: uint64
+          description: One past the last raw ledger-event ID examined.
+        highest_event_id:
+          type: integer
+          format: uint64
+          description: One past the latest ledger-event ID currently indexed.
+      required: [events, scanned_through, highest_event_id]
+    WalletEventsEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/WalletEventsResult"
+
+    ShieldedSyncRequest:
+      type: object
+      properties:
+        viewing_key:
+          type: string
+          description: Raw 32-byte Zswap key or official SDK serialization, hex-encoded (optional `0x` prefix).
+        from_index:
+          type: integer
+          format: uint64
+          default: 0
+          description: >
+            First Zswap commitment-tree index the wallet has not yet applied;
+            `applied_through` from the previous response.
+      required: [viewing_key]
+    ShieldedSyncUpdate:
+      description: >
+        Tagged on `type`. `collapsed` covers a run of tree indices none of
+        whose transactions are relevant to the key; `transaction` carries a
+        relevant transaction's Zswap events. Both span
+        `[from_index, to_index)`; consecutive updates abut.
+      oneOf:
+        - $ref: "#/components/schemas/ShieldedSyncCollapsedUpdate"
+        - $ref: "#/components/schemas/ShieldedSyncTransactionUpdate"
+      discriminator:
+        propertyName: type
+        mapping:
+          collapsed: "#/components/schemas/ShieldedSyncCollapsedUpdate"
+          transaction: "#/components/schemas/ShieldedSyncTransactionUpdate"
+    ShieldedSyncCollapsedUpdate:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [collapsed]
+        from_index:
+          type: integer
+          format: uint64
+        to_index:
+          type: integer
+          format: uint64
+          description: Exclusive.
+        protocol_version:
+          type: integer
+          description: Protocol version at the indexed tip, which the collapsed update was built under.
+        update:
+          allOf:
+            - $ref: "#/components/schemas/Hex"
+          description: Serialized Zswap collapsed Merkle-tree update for `[from_index, to_index)`.
+      required: [type, from_index, to_index, protocol_version, update]
+    ShieldedSyncTransactionUpdate:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [transaction]
+        from_index:
+          type: integer
+          format: uint64
+          description: First Zswap tree index this transaction wrote.
+        to_index:
+          type: integer
+          format: uint64
+          description: One past the last Zswap tree index this transaction wrote.
+        protocol_version:
+          type: integer
+          description: Protocol version of the transaction's block.
+        tx_id:
+          type: integer
+          format: uint64
+        tx_hash:
+          type: string
+        events:
+          type: array
+          description: The transaction's Zswap events only, in emission order.
+          items:
+            $ref: "#/components/schemas/Event"
+      required: [type, from_index, to_index, protocol_version, tx_id, tx_hash, events]
+    ShieldedSyncResult:
+      type: object
+      properties:
+        updates:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShieldedSyncUpdate"
+        applied_through:
+          type: integer
+          format: uint64
+          description: >
+            Tree index the wallet is at after applying every update; pass it
+            as the next `from_index`. Equals `highest_index` on success.
+        highest_index:
+          type: integer
+          format: uint64
+          description: First free Zswap tree index at the sync boundary.
+        scanned_transactions:
+          type: integer
+          format: uint64
+          description: Number of transactions (global `Tx.id`s from 0) the relevance scan covers; the sync boundary.
+      required: [updates, applied_through, highest_index, scanned_transactions]
+    ShieldedSyncEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/ShieldedSyncResult"
+
+    DustSyncResult:
+      type: object
+      properties:
+        events:
+          type: array
+          description: DUST events only, ascending by id.
+          items:
+            $ref: "#/components/schemas/Event"
+        scanned_through:
+          type: integer
+          format: uint64
+          description: >
+            Pass as the next `from`. One past the last returned event id when
+            the page was full; `highest_event_id` when it wasn't (caught up).
+        highest_event_id:
+          type: integer
+          format: uint64
+          description: One past the latest ledger-event ID currently indexed.
+      required: [events, scanned_through, highest_event_id]
+    DustSyncEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/DustSyncResult"
+
+    ContractEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          properties:
+            tx_hash:
+              type: string
+            contract_address:
+              type: string
+            contract_action_id:
+              type: integer
+              format: uint64
+              nullable: true
+              description: >
+                Id of the emitting contract call under
+                `/contracts/{addr}/actions`. Null when several calls in the
+                same transaction share address and entry point and cannot be
+                distinguished.
+          required: [tx_hash, contract_address, contract_action_id]
+    ContractEventListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            results:
+              type: array
+              items:
+                $ref: "#/components/schemas/ContractEvent"
+
+    Balance:
+      type: object
+      properties:
+        token_type:
+          type: string
+        amount:
+          type: string
+          description: u128, as a decimal string.
+      required: [token_type, amount]
+    BalanceListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              type: array
+              items:
+                $ref: "#/components/schemas/Balance"
+
+    HashListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            results:
+              type: array
+              items:
+                type: string
+
+    Contract:
+      type: object
+      properties:
+        address:
+          type: string
+        deploy_action_id:
+          type: integer
+          format: uint64
+        latest_action_id:
+          type: integer
+          format: uint64
+        latest_action_type:
+          type: string
+          enum: [deploy, call, update]
+        latest_block_height:
+          type: integer
+          format: uint64
+        state_hash:
+          type: string
+          nullable: true
+          description: >
+            Content hash of the latest stored state, hex-encoded. Cheap
+            change detection: poll this and fetch `/contracts/{addr}/state`
+            only when it changes. Null when the latest action failed and
+            left no state.
+        balances:
+          type: array
+          items:
+            $ref: "#/components/schemas/Balance"
+      required:
+        - address
+        - deploy_action_id
+        - latest_action_id
+        - latest_action_type
+        - latest_block_height
+        - state_hash
+        - balances
+    ContractEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/Contract"
+
+    ContractListItem:
+      type: object
+      properties:
+        address:
+          type: string
+        deploy_action_id:
+          type: integer
+          format: uint64
+        latest_action_id:
+          type: integer
+          format: uint64
+      required: [address, deploy_action_id, latest_action_id]
+    ContractListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            results:
+              type: array
+              items:
+                $ref: "#/components/schemas/ContractListItem"
+
+    ContractState:
+      type: object
+      properties:
+        address:
+          type: string
+        block_height:
+          type: integer
+          format: uint64
+        state:
+          type: string
+          description: Raw contract state, hex-encoded.
+      required: [address, block_height, state]
+    ContractStateEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/ContractState"
+
+    ContractAction:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: uint64
+        type:
+          type: string
+          enum: [deploy, call, update]
+        entry_point:
+          type: string
+          nullable: true
+          description: Present only when type is call.
+        tx_hash:
+          type: string
+        block_height:
+          type: integer
+          format: uint64
+        state_hash:
+          type: string
+          nullable: true
+          description: >
+            Content hash of the block-final state stored for this action,
+            hex-encoded; null for a failed action. Lets a client page history
+            and fetch only the states that actually changed.
+      required: [id, type, entry_point, tx_hash, block_height, state_hash]
+    ContractActionListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            results:
+              type: array
+              items:
+                $ref: "#/components/schemas/ContractAction"
+
+    Registration:
+      type: object
+      properties:
+        cardano_stake_key:
+          type: string
+        dust_address:
+          type: string
+        valid:
+          type: boolean
+        registered_at_height:
+          type: integer
+          format: uint64
+        removed_at_height:
+          type: integer
+          format: uint64
+          nullable: true
+        utxo_id:
+          type: string
+          nullable: true
+        utxo_index:
+          type: integer
+          format: uint64
+          nullable: true
+      required:
+        - cardano_stake_key
+        - dust_address
+        - valid
+        - registered_at_height
+        - removed_at_height
+        - utxo_id
+        - utxo_index
+    RegistrationListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            results:
+              type: array
+              items:
+                $ref: "#/components/schemas/Registration"
+
+    DustGenerationStatus:
+      type: object
+      properties:
+        cardano_stake_key:
+          type: string
+          description: The 29-byte stake key, hex-encoded, whichever form was supplied.
+        registered:
+          type: boolean
+        dust_address:
+          type: string
+          nullable: true
+        night_balance:
+          type: string
+          description: NIGHT balance backing DUST generation, in STAR, as a decimal string.
+        generation_rate:
+          type: string
+          description: SPECK/second, as a decimal string.
+        current_capacity:
+          type: string
+          description: Currently generated DUST, in SPECK, as a decimal string.
+        max_capacity:
+          type: string
+          description: Maximum DUST capacity for this NIGHT balance, in SPECK, as a decimal string.
+      required:
+        - cardano_stake_key
+        - registered
+        - dust_address
+        - night_balance
+        - generation_rate
+        - current_capacity
+        - max_capacity
+    DustGenerationStatusEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PointEnvelope"
+        - type: object
+          properties:
+            results:
+              $ref: "#/components/schemas/DustGenerationStatus"
+
+    # Paginated collection endpoints: next_cursor is a string while there's a
+    # further page, null once exhausted. `results` is always present; its
+    # shape is supplied by the endpoint-specific envelope.
+    Envelope:
+      type: object
+      properties:
+        tip:
+          $ref: "#/components/schemas/Tip"
+        next_cursor:
+          type: string
+          nullable: true
+      required: [results, tip, next_cursor]
+
+    # Point lookups and unpaginated full-list endpoints: no next_cursor field
+    # at all, there being no further page to fetch.
+    PointEnvelope:
+      type: object
+      properties:
+        tip:
+          $ref: "#/components/schemas/Tip"
+      required: [results, tip]

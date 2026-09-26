@@ -33,8 +33,9 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v0/blocks/{id}", get(routes::block_by_id))
         .route("/api/v0/blocks/{id}/txs", get(routes::block_txs))
         .route("/api/v0/txs/{hash}", get(entities::tx))
+        .route("/api/v0/txs/{hash}/raw", get(entities::tx_raw))
         .route(
-            "/api/v0/tx-identifiers/{identifier}",
+            "/api/v0/txs/identifiers/{identifier}",
             get(entities::tx_by_identifier),
         )
         .route("/api/v0/txs/{hash}/utxos", get(entities::tx_utxos))

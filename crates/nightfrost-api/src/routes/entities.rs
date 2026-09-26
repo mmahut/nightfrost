@@ -11,7 +11,11 @@ use crate::{
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, header::CACHE_CONTROL},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH},
+    },
+    response::{IntoResponse, Response},
 };
 use nightfrost_core::{
     domain::{
@@ -50,6 +54,7 @@ pub struct TxResponse {
     pub block_height: u64,
     pub block_hash: String,
     pub block_time: u64,
+    pub block_author: Option<String>,
     pub index: u32,
     pub protocol_version: u32,
     pub variant: TransactionVariant,
@@ -108,6 +113,7 @@ fn tx_response(state: &AppState, tx_id: u64, record: TxRecord) -> Result<TxRespo
         block_height: record.block_height,
         block_hash: const_hex::encode(block.hash),
         block_time: block.timestamp,
+        block_author: block.author.map(const_hex::encode),
         index: record.index_in_block,
         protocol_version: block.protocol_version,
         variant: record.variant,
@@ -129,6 +135,36 @@ pub async fn tx(
 ) -> Result<Json<PointResponse<TxResponse>>, ApiError> {
     let (tx_id, record) = tx_by_hash(&state, &hash)?;
     response(&state, tx_response(&state, tx_id, record)?)
+}
+
+pub async fn tx_raw(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let (_, record) = tx_by_hash(&state, &hash)?;
+    let etag = format!("\"{}\"", const_hex::encode(Sha256::digest(&record.raw.0)));
+    let unchanged = headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|value| {
+            let tag = value.trim();
+            tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag
+        });
+    let mut response = if unchanged {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        ([(CONTENT_TYPE, "application/octet-stream")], record.raw.0).into_response()
+    };
+    response
+        .headers_mut()
+        .insert(ETAG, etag.parse().map_err(internal)?);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("public, no-cache"));
+    Ok(response)
 }
 
 pub async fn tx_by_identifier(

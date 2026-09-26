@@ -175,7 +175,7 @@ export class NightfrostApi {
   }
 
   txByIdentifier(identifier: string): Promise<Tx> {
-    return this.request<Tx>('/tx-identifiers/' + identifier);
+    return this.request<Tx>('/txs/identifiers/' + identifier);
   }
 
   txUtxos(hash: string): Promise<TxUtxos> {
