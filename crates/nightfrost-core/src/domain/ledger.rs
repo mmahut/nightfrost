@@ -15,6 +15,7 @@
 
 mod contract_state;
 mod ledger_state;
+mod state_translation_v8_to_v9;
 mod transaction;
 
 pub use contract_state::*;
@@ -97,9 +98,6 @@ pub enum Error {
 
     #[error("cannot translate ledger state {0} to old {1}")]
     BackwardsLedgerStateTranslation(LedgerVersion, LedgerVersion),
-
-    #[error("translating ledger state from {0} to {1} not yet supported")]
-    UnsupportedLedgerStateTranslation(LedgerVersion, LedgerVersion),
 
     #[error("cannot translate ledger state from {0} to {1}")]
     LedgerStateTranslation(LedgerVersion, LedgerVersion, #[source] io::Error),

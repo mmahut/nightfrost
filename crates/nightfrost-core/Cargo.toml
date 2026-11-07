@@ -11,7 +11,9 @@ midnight-base-crypto_v1      = { workspace = true }
 midnight-coin-structure_v2   = { workspace = true }
 midnight-ledger_v8           = { workspace = true }
 midnight-onchain-runtime_v3  = { workspace = true }
+midnight-onchain-state_v3    = { workspace = true }
 midnight-serialize_v1        = { workspace = true }
+midnight-storage_v3          = { workspace = true }
 midnight-storage-core_v1     = { workspace = true, features = ["layout-v2", "gc-v1"] }
 midnight-transient-crypto_v2 = { workspace = true }
 midnight-zswap_v8            = { workspace = true }
@@ -19,8 +21,11 @@ midnight-zswap_v8            = { workspace = true }
 midnight-coin-structure_v3   = { workspace = true }
 midnight-ledger_v9           = { workspace = true }
 midnight-onchain-runtime_v4  = { workspace = true }
+midnight-onchain-state_v4    = { workspace = true }
 midnight-transient-crypto_v3 = { workspace = true }
 midnight-zswap_v9            = { workspace = true }
+# ledger team v8 -> v9 state translation table (pinned by rev at the workspace)
+v8-to-v9-state-translation   = { workspace = true }
 
 const-hex          = { workspace = true, features = ["serde"] }
 derive_more        = { workspace = true, features = ["as_ref", "debug", "deref", "display", "from", "into"] }
@@ -36,5 +41,6 @@ tokio              = { workspace = true, features = ["time"] }
 tracing            = { workspace = true }
 
 [dev-dependencies]
+midnight-storage_v2 = { workspace = true }
 serde_json = { workspace = true }
 tempfile   = "3"

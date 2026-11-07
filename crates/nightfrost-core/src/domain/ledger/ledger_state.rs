@@ -303,9 +303,31 @@ impl LedgerState {
         match (self, ledger_version) {
             (s @ LedgerState::V8 { .. }, LedgerVersion::V8) => Ok(s),
             (s @ LedgerState::V9 { .. }, LedgerVersion::V9) => Ok(s),
-            (LedgerState::V8 { .. }, LedgerVersion::V9) => Err(
-                Error::UnsupportedLedgerStateTranslation(LedgerVersion::V8, LedgerVersion::V9),
-            ),
+            // The ledger v8 -> v9 hard-fork boundary: the replayed state is V8
+            // and the block reports V9, so this fires exactly once. The
+            // translated state must reproduce the node's post-migration arena
+            // root bit-for-bit; the pipeline's per-block root check enforces it.
+            (
+                LedgerState::V8 {
+                    ledger_state,
+                    block_fullness,
+                },
+                LedgerVersion::V9,
+            ) => {
+                let ledger_state =
+                    super::state_translation_v8_to_v9::translate_ledger_state(ledger_state)
+                        .map_err(|error| {
+                            Error::LedgerStateTranslation(
+                                LedgerVersion::V8,
+                                LedgerVersion::V9,
+                                error,
+                            )
+                        })?;
+                Ok(LedgerState::V9 {
+                    ledger_state,
+                    block_fullness,
+                })
+            }
             (LedgerState::V9 { .. }, LedgerVersion::V8) => Err(
                 Error::BackwardsLedgerStateTranslation(LedgerVersion::V9, LedgerVersion::V8),
             ),
@@ -636,10 +658,18 @@ impl LedgerState {
                     whitelist: None,
                 };
 
+                // Must match the node byte-for-byte: the node feeds `block_fullness`
+                // with the stateless `cost`, and fee prices derive from that
+                // accumulator. Feeding it the state-aware cost diverges on contract
+                // calls and breaks the ledger root (upstream shielded-sre#515).
+                let fullness_cost = transaction
+                    .cost(&ledger_state.parameters, true)
+                    .map_err(|error| Error::TransactionCost(error.into()))?;
                 // The stateless `cost` estimates verifier-key sizes, under-costing
                 // contract calls; `cost_with_state` reads them from the ledger state.
-                // The ledger has no state-aware `fees`, so the fee is computed from
-                // the cost the same way `Transaction::fees` does.
+                // Used for the reported `fees` only, never for consensus state. The
+                // ledger has no state-aware `fees`, so the fee is computed from the
+                // cost the same way `Transaction::fees` does.
                 let cost = transaction
                     .cost_with_state(&ledger_state.parameters, ledger_state, true)
                     .map_err(|error| Error::TransactionCost(error.into()))?;
@@ -663,6 +693,7 @@ impl LedgerState {
                     .map_err(|error| Error::MalformedTransaction(error.into()))?;
                 let (ledger_state, transaction_result) =
                     ledger_state.apply(&verified_ledger_transaction, &cx);
+                tracing::debug!(?transaction_result, "applied v9 transaction");
 
                 let (transaction_result, events, should_count_cost) = match transaction_result {
                     TransactionResultV9::Success(events) => {
@@ -682,7 +713,7 @@ impl LedgerState {
 
                 // Only count cost for successful/partial transactions (match node behavior)
                 let block_fullness = if should_count_cost {
-                    *block_fullness + cost
+                    *block_fullness + fullness_cost
                 } else {
                     *block_fullness
                 };
@@ -2511,8 +2542,11 @@ mod tests {
             .expect("ledger state v9 can be translated to v9");
         assert_eq!(new_ledger_state_v9, ledger_state_v9);
 
-        // Cross-version translations are unsupported in both directions.
-        assert!(ledger_state.translate(LedgerVersion::V9).is_err());
+        // Forward across the v8 -> v9 hard fork is supported; backwards is not.
+        let translated = ledger_state
+            .translate(LedgerVersion::V9)
+            .expect("ledger state v8 can be translated to v9");
+        assert_eq!(translated.ledger_version(), LedgerVersion::V9);
         assert!(ledger_state_v9.translate(LedgerVersion::V8).is_err());
 
         Ok(())

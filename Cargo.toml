@@ -19,22 +19,41 @@ nightfrost-core  = { path = "crates/nightfrost-core" }
 nightfrost-chain = { path = "crates/nightfrost-chain" }
 nightfrost-api   = { path = "crates/nightfrost-api" }
 
-# Ledger v8 from crates.io. base-crypto and serialize are patched to the rc
-# tags below and shared with v9 (within-major). Aliases match midnight-indexer.
-midnight-base-crypto_v1      = { package = "midnight-base-crypto", version = "1" }
-midnight-coin-structure_v2   = { package = "midnight-coin-structure", version = "2" }
-midnight-ledger_v8           = { package = "midnight-ledger", version = "8" }
-midnight-onchain-runtime_v3  = { package = "midnight-onchain-runtime", version = "3" }
-midnight-serialize_v1        = { package = "midnight-serialize", version = "1" }
-midnight-storage-core_v1     = { package = "midnight-storage-core", version = "1.2" }
-midnight-transient-crypto_v2 = { package = "midnight-transient-crypto", version = "2" }
-midnight-zswap_v8            = { package = "midnight-zswap", version = "8" }
-# Ledger v9, resolved via the [patch.crates-io] tags below.
-midnight-coin-structure_v3   = { package = "midnight-coin-structure", version = "3" }
-midnight-ledger_v9           = { package = "midnight-ledger-v9", version = "1.0" }
-midnight-onchain-runtime_v4  = { package = "midnight-onchain-runtime", version = "4" }
-midnight-transient-crypto_v3 = { package = "midnight-transient-crypto", version = "3" }
-midnight-zswap_v9            = { package = "midnight-zswap", version = "9" }
+# Ledger crates, all from crates.io, pinned to exactly what midnight-node
+# `node-2.1.101` (the live 2.1 network) resolves. Every block's ledger root is
+# checked against the node's, so replay has to run the node's exact ledger
+# code: with ledger 9.1.0.0-rc.6, preview block 10067's contract call ran out
+# of gas in replay while the node applied it; 9.1.0.1 (onchain-vm 4.0.1 changed
+# gas charging) replays it as the node does. Re-diff this list against the
+# node's Cargo.lock whenever the network's node release moves.
+#
+# Shared by both ledger majors.
+midnight-base-crypto_v1      = { package = "midnight-base-crypto", version = "=1.1.1" }
+midnight-serialize_v1        = { package = "midnight-serialize", version = "=1.2.1" }
+# One storage-core, so the v8 and v9 states share one arena.
+midnight-storage-core_v1     = { package = "midnight-storage-core", version = "=1.2.3" }
+# Ledger v8.
+midnight-coin-structure_v2   = { package = "midnight-coin-structure", version = "=2.0.2" }
+midnight-ledger_v8           = { package = "midnight-ledger", version = "=8.1.3" }
+midnight-onchain-runtime_v3  = { package = "midnight-onchain-runtime", version = "=3.1.2" }
+midnight-onchain-state_v3    = { package = "midnight-onchain-state", version = "=3.0.2" }
+midnight-transient-crypto_v2 = { package = "midnight-transient-crypto", version = "=2.2.0" }
+midnight-zswap_v8            = { package = "midnight-zswap", version = "=8.1.3" }
+# Ledger v9 (ledger 9.1.0.1). storage went to a new major; it also hosts the
+# v8 -> v9 translation machinery (`state-translation`).
+midnight-coin-structure_v3   = { package = "midnight-coin-structure", version = "=3.0.1" }
+midnight-ledger_v9           = { package = "midnight-ledger-v9", version = "=1.0.1" }
+midnight-onchain-runtime_v4  = { package = "midnight-onchain-runtime", version = "=4.0.1" }
+midnight-onchain-state_v4    = { package = "midnight-onchain-state", version = "=4.0.1" }
+midnight-storage_v3          = { package = "midnight-storage", version = "=3.0.0", features = ["state-translation"] }
+# v8-side storage, only for tests that name v8 trie types (they sit behind
+# `public-internal-structure`).
+midnight-storage_v2          = { package = "midnight-storage", version = "=2.0.5", features = ["public-internal-structure"] }
+midnight-transient-crypto_v3 = { package = "midnight-transient-crypto", version = "=3.0.1" }
+midnight-zswap_v9            = { package = "midnight-zswap", version = "=9.0.1" }
+# The ledger team's v8 -> v9 translation table. Unpublished, so pinned by the
+# same git tag as the node.
+v8-to-v9-state-translation   = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "state-translation-v8-v9-node-2.1.101" }
 
 anyhow             = { version = "1.0" }
 async-stream       = { version = "0.3" }
@@ -62,26 +81,11 @@ tower-http         = { version = "0.7", features = ["cors"] }
 tracing            = { version = "0.1" }
 tracing-subscriber = { version = "0.3" }
 
-# Ledger 9.1.0.0-rc.3 patch set, copied verbatim from midnight-indexer 4.3.5
-# (v8/v9 coexistence shape traces to midnight-ledger#580). The rc crates aren't
-# on crates.io yet, hence git tags.
 [patch.crates-io]
 # fjall 2.11.2 vendored with added journal-eviction/recovery diagnostics
 # (PATCHED(nightfrost) markers) after a production write-halt livelock;
 # drop when upgrading to fjall 3, which rewrote the stall bookkeeping.
 fjall                         = { path = "vendor/fjall" }
-midnight-base-crypto          = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "base-crypto-1.1.0-rc.2" }
-midnight-base-crypto-derive   = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "base-crypto-derive-1.1.0-rc.2" }
-midnight-serialize            = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "serialize-1.2.0-rc.1" }
-midnight-zkir                 = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "zkir-2.2.0-rc.3" }
-midnight-transient-crypto-old = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "transient-crypto-2.2.0-rc.1", package = "midnight-transient-crypto", version = "2.2.0" }
-midnight-ledger-v9            = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "crate-ledger-9.1.0.0-rc.3" }
-midnight-zswap_v9             = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "zswap-9.0.0-rc.3",           package = "midnight-zswap",           version = "9.0.0" }
-midnight-coin-structure_v3    = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "coin-structure-3.0.0-rc.1",  package = "midnight-coin-structure",  version = "3.0.0" }
-midnight-transient-crypto_v3  = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "transient-crypto-3.0.0-rc.2", package = "midnight-transient-crypto", version = "3.0.0" }
-midnight-onchain-runtime_v4   = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "onchain-runtime-4.0.0-rc.2", package = "midnight-onchain-runtime", version = "4.0.0" }
-midnight-onchain-state_v4     = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "onchain-state-4.0.0-rc.3",   package = "midnight-onchain-state",   version = "4.0.0" }
-midnight-onchain-vm_v4        = { git = "https://github.com/midnightntwrk/midnight-ledger", tag = "onchain-vm-4.0.0-rc.2",      package = "midnight-onchain-vm",      version = "4.0.0" }
 
 [profile.release]
 lto = "thin"
