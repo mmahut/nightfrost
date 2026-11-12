@@ -158,7 +158,9 @@ mod tests {
     /// Rebuild every expected ID from the node's actual crate types and compare.
     #[test]
     fn table_tags_match_types() {
-        use midnight_storage_v2::merkle_patricia_trie::{MerklePatriciaTrie as V8Mpt, Node as V8Node};
+        use midnight_storage_v2::merkle_patricia_trie::{
+            MerklePatriciaTrie as V8Mpt, Node as V8Node,
+        };
         use midnight_storage_v2::storable::SizeAnn;
         use storage::merkle_patricia_trie::{MerklePatriciaTrie, Node};
 
