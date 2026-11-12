@@ -53,6 +53,12 @@ const CATCH_UP_GC_INTERVAL: u64 = 16;
 const LEDGER_STATE_RETENTION: usize = 32;
 const PROGRESS_LOG_INTERVAL: u64 = 1_000;
 
+/// Consecutive failed node fetches tolerated before the error is surfaced.
+/// With NODE_FETCH_MAX_BACKOFF this waits about two minutes in total, well
+/// inside STALL_TIMEOUT.
+const NODE_FETCH_RETRIES: u32 = 8;
+const NODE_FETCH_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
 /// If no block has been successfully indexed for this long, the pipeline is
 /// considered stalled and the process exits for systemd to restart it. Real
 /// per-block work (including catch-up chunk fetches) always completes in
@@ -349,32 +355,69 @@ fn node_blocks(
     mut node: SubxtNode,
 ) -> impl Stream<Item = anyhow::Result<Block>> {
     stream! {
+        // Consecutive failed fetches since the last block was delivered.
+        let mut failures = 0u32;
         loop {
             let blocks = node.finalized_blocks(highest_block);
             let mut blocks = pin!(blocks);
 
             while let Some(block) = blocks.next().await {
-                if let Ok(block) = &block {
-                    let expected = highest_block.map(|b| b.hash).unwrap_or_default();
-                    if block.parent_hash != expected {
+                let block = match block {
+                    Ok(block) => block,
+                    // A node can answer a live connection with a transient RPC
+                    // error (seen: `-32603 Internal error` fetching events from
+                    // a public archive node), which the reconnecting client
+                    // does not retry. Fetching is read-only and nothing past
+                    // `highest_block` has been yielded, so back off and
+                    // re-subscribe from it. Only after NODE_FETCH_RETRIES
+                    // consecutive failures does the error reach the pipeline
+                    // (and the process exit for systemd to restart it).
+                    Err(error) if failures < NODE_FETCH_RETRIES => {
+                        failures += 1;
+                        let delay = node_fetch_backoff(failures);
                         tracing::warn!(
-                            height = block.height,
-                            parent_hash = %block.parent_hash,
-                            expected = %expected,
-                            "unexpected block, re-subscribing"
+                            error = format!("{:#}", anyhow::Error::from(error)),
+                            attempt = failures,
+                            max_attempts = NODE_FETCH_RETRIES,
+                            ?delay,
+                            "node fetch failed, retrying"
                         );
-                        m::RESUBSCRIBES.inc();
+                        m::NODE_FETCH_RETRIES.inc();
+                        sleep(delay).await;
                         break;
                     }
-                    highest_block = Some(BlockRef::from(block));
-                }
+                    Err(error) => {
+                        yield Err(error.into());
+                        return;
+                    }
+                };
 
-                yield block.map_err(Into::into);
+                let expected = highest_block.map(|b| b.hash).unwrap_or_default();
+                if block.parent_hash != expected {
+                    tracing::warn!(
+                        height = block.height,
+                        parent_hash = %block.parent_hash,
+                        expected = %expected,
+                        "unexpected block, re-subscribing"
+                    );
+                    m::RESUBSCRIBES.inc();
+                    break;
+                }
+                highest_block = Some(BlockRef::from(&block));
+                failures = 0;
+
+                yield Ok(block);
             }
 
             sleep(Duration::from_millis(100)).await;
         }
     }
+}
+
+/// Exponential backoff for retrying a failed node fetch: 1s, 2s, 4s, ... capped
+/// at NODE_FETCH_MAX_BACKOFF.
+fn node_fetch_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << attempt.saturating_sub(1).min(16)).min(NODE_FETCH_MAX_BACKOFF)
 }
 
 /// Replay one block: apply all transactions to the ledger state, verify the
@@ -1146,4 +1189,20 @@ fn apply_registration_event(
 
     batch.insert(&store.cnight_registrations, key, store::encode(&record));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_fetch_backoff_doubles_then_caps() {
+        let delays = (1..=NODE_FETCH_RETRIES)
+            .map(|attempt| node_fetch_backoff(attempt).as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
+        // Total wait stays well inside the stall watchdog.
+        assert!(Duration::from_secs(delays.iter().sum()) < STALL_TIMEOUT);
+        assert_eq!(node_fetch_backoff(u32::MAX), NODE_FETCH_MAX_BACKOFF);
+    }
 }

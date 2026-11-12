@@ -3,8 +3,11 @@
 // ---------- env / config ----------
 
 export function config() {
+  const oracle = process.env.ORACLE_URL ?? 'https://midnight-preview.blockfrost.io/api/v0';
+  // Blockfrost needs a project token; a plain Midnight indexer (e.g. the
+  // stagenet one at indexer.stagenet.shielded.tools) does not.
   const token = process.env.MIDNIGHT_BLOCKFROST_TOKEN;
-  if (!token) {
+  if (!token && new URL(oracle).hostname.endsWith('blockfrost.io')) {
     console.error('MIDNIGHT_BLOCKFROST_TOKEN is not set');
     process.exit(2);
   }
@@ -12,7 +15,7 @@ export function config() {
     token,
     nightfrost:
       (process.env.NIGHTFROST_URL ?? 'http://127.0.0.1:3100').replace(/\/$/, '') + '/api/v0',
-    oracle: process.env.ORACLE_URL ?? 'https://midnight-preview.blockfrost.io/api/v0',
+    oracle,
     seed: Number(process.env.SAMPLE_SEED ?? 20260805),
     randomBlocks: Number(process.env.RANDOM_BLOCKS ?? 30),
     recentBlocks: Number(process.env.RECENT_BLOCKS ?? 20),
@@ -166,7 +169,10 @@ export function makeContext(cfg) {
     stats.oracleCalls++;
     const res = await httpJson(cfg.oracle, {
       method: 'POST',
-      headers: { project_id: cfg.token, 'content-type': 'application/json' },
+      headers: {
+        ...(cfg.token ? { project_id: cfg.token } : {}),
+        'content-type': 'application/json',
+      },
       body: JSON.stringify({ query }),
     });
     if (res.errors) throw new Error('GraphQL errors: ' + JSON.stringify(res.errors).slice(0, 500));

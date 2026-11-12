@@ -151,6 +151,12 @@ pub async fn metrics(State(state): State<Arc<ApiState>>) -> Result<String, ApiEr
         "Times the block stream broke parent linkage and the pipeline re-subscribed",
         m::RESUBSCRIBES.get(),
     );
+    counter(
+        &mut out,
+        "nightfrost_pipeline_node_fetch_retries_total",
+        "Failed node fetches retried by re-subscribing after a backoff",
+        m::NODE_FETCH_RETRIES.get(),
+    );
 
     // ---- node client -------------------------------------------------------------
     counter(

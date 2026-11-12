@@ -10,8 +10,12 @@ pub fn run(config_path: &str, force: bool) -> anyhow::Result<()> {
     crate::banner::print();
     println!("Let's set up your nightfrost config.\n");
 
-    let network = prompt_choice("Network", &["preview", "preprod", "mainnet"], "preview")?;
-    let default_node_url = format!("wss://rpc.{network}.midnight.network");
+    let network = prompt_choice(
+        "Network",
+        &["preview", "preprod", "stagenet", "mainnet"],
+        "preview",
+    )?;
+    let default_node_url = default_node_url(&network);
     let node_url = prompt("Node URL", &default_node_url)?;
     let data_dir = prompt("Data directory", &format!("./data-{network}"))?;
     let listen = prompt("Listen address", "127.0.0.1:3000")?;
@@ -37,6 +41,14 @@ pub fn run(config_path: &str, force: bool) -> anyhow::Result<()> {
 
     println!("\nwrote {config_path} — run `nightfrost` to start.");
     Ok(())
+}
+
+/// Public archive RPC endpoint for each known network.
+fn default_node_url(network: &str) -> String {
+    match network {
+        "stagenet" => "wss://rpc.stagenet.shielded.tools".to_string(),
+        other => format!("wss://rpc.{other}.midnight.network"),
+    }
 }
 
 fn prompt(label: &str, default: &str) -> anyhow::Result<String> {

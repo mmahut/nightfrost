@@ -73,6 +73,8 @@ pub static LAST_BLOCK_CHAIN_UNIX_SECS: Gauge = Gauge::new();
 /// Times the block stream delivered a block whose parent was not the last
 /// one seen and the pipeline re-subscribed.
 pub static RESUBSCRIBES: Counter = Counter::new();
+/// Times a failed node fetch was retried by re-subscribing after a backoff.
+pub static NODE_FETCH_RETRIES: Counter = Counter::new();
 
 /// Adds a stage duration to its counter and hands it back, so call sites can
 /// keep accumulating into their local `StageTimes` in one expression.
