@@ -31,7 +31,7 @@ struct Args {
     )]
     node_url: String,
 
-    /// Network id for ledger state initialization (preview, preprod, testnet, or empty for mainnet)
+    /// Network id for ledger state initialization (preview, preprod, stagenet, testnet, or empty for mainnet)
     #[arg(
         long,
         global = true,

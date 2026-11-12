@@ -71,6 +71,20 @@ nightfrost \
     --metrics-listen 127.0.0.1:3001
 ```
 
+Stagenet runs node 2.0 (ledger v9 from genesis) and is served by the public
+archive node at `rpc.stagenet.shielded.tools`. Node 2.0 uses the ledger
+`9.1.0.0-rc.3` crates, which replay differently from the `9.1.0.1` release the
+other networks run, so stagenet needs a build of the `stagenet` branch (pinned
+to rc.3, without the v8 -> v9 hard-fork translation, so it cannot sync
+mainnet, preprod or preview):
+
+```sh
+nightfrost \
+    --node-url wss://rpc.stagenet.shielded.tools \
+    --network-id stagenet \
+    --data-dir /var/lib/nightfrost-stagenet
+```
+
 ### Snapshots
 
 You can use `nightfrost snapshot` subcommands to create and load snapshots.
@@ -83,6 +97,7 @@ We also support `--trust-me-bro` which will download our snapshots, don't trust 
 
 The snapshot is picked by `--network-id` (or `NIGHTFROST_NETWORK_ID`), which
 defaults to `preview`; pass `mainnet` or `preprod` to restore those instead.
+No stagenet snapshot is published; stagenet syncs from genesis.
 
 ### Example clients
 

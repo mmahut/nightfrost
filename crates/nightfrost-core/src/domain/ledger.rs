@@ -15,7 +15,6 @@
 
 mod contract_state;
 mod ledger_state;
-mod state_translation_v8_to_v9;
 mod transaction;
 
 pub use contract_state::*;
@@ -63,6 +62,9 @@ type IntentV9<D> =
 /// Ledger related errors.
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("translating ledger state from {0} to {1} not yet supported")]
+    UnsupportedLedgerStateTranslation(LedgerVersion, LedgerVersion),
+
     #[error("cannot load ledger state for key {}", const_hex::encode(.0))]
     LoadLedgerState(SerializedLedgerStateKey, #[source] io::Error),
 

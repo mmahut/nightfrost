@@ -17,6 +17,15 @@ export MIDNIGHT_BLOCKFROST_TOKEN=...   # Blockfrost project token — secret, en
 node tests/differential/run.mjs
 ```
 
+Against stagenet, use the public Midnight indexer as the oracle (no token
+needed for non-Blockfrost oracles):
+
+```sh
+ORACLE_URL=https://indexer.stagenet.shielded.tools/api/v4/graphql \
+NIGHTFROST_URL=http://127.0.0.1:3000 \
+node tests/differential/run.mjs
+```
+
 On Nix systems:
 
 ```sh
@@ -31,7 +40,7 @@ stdout; a machine-readable report is written to `tests/differential/report.json`
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MIDNIGHT_BLOCKFROST_TOKEN` | (required) | Blockfrost project token. Never write it to a file. |
+| `MIDNIGHT_BLOCKFROST_TOKEN` | (required for Blockfrost oracles) | Blockfrost project token. Never write it to a file. |
 | `NIGHTFROST_URL` | `http://127.0.0.1:3100` | nightfrost instance under test |
 | `ORACLE_URL` | `https://midnight-preview.blockfrost.io/api/v0` | oracle GraphQL endpoint |
 | `SAMPLE_SEED` | `20260805` | PRNG seed — same seed, same sample |

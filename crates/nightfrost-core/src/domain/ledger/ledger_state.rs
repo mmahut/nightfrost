@@ -303,31 +303,12 @@ impl LedgerState {
         match (self, ledger_version) {
             (s @ LedgerState::V8 { .. }, LedgerVersion::V8) => Ok(s),
             (s @ LedgerState::V9 { .. }, LedgerVersion::V9) => Ok(s),
-            // The ledger v8 -> v9 hard-fork boundary: the replayed state is V8
-            // and the block reports V9, so this fires exactly once. The
-            // translated state must reproduce the node's post-migration arena
-            // root bit-for-bit; the pipeline's per-block root check enforces it.
-            (
-                LedgerState::V8 {
-                    ledger_state,
-                    block_fullness,
-                },
-                LedgerVersion::V9,
-            ) => {
-                let ledger_state =
-                    super::state_translation_v8_to_v9::translate_ledger_state(ledger_state)
-                        .map_err(|error| {
-                            Error::LedgerStateTranslation(
-                                LedgerVersion::V8,
-                                LedgerVersion::V9,
-                                error,
-                            )
-                        })?;
-                Ok(LedgerState::V9 {
-                    ledger_state,
-                    block_fullness,
-                })
-            }
+            // The v8 -> v9 hard-fork translation is not available on the
+            // stagenet branch (it needs the ledger 9.1.0.1 crates); stagenet
+            // is ledger 9 from genesis and never crosses it.
+            (LedgerState::V8 { .. }, LedgerVersion::V9) => Err(
+                Error::UnsupportedLedgerStateTranslation(LedgerVersion::V8, LedgerVersion::V9),
+            ),
             (LedgerState::V9 { .. }, LedgerVersion::V8) => Err(
                 Error::BackwardsLedgerStateTranslation(LedgerVersion::V9, LedgerVersion::V8),
             ),
@@ -2542,11 +2523,8 @@ mod tests {
             .expect("ledger state v9 can be translated to v9");
         assert_eq!(new_ledger_state_v9, ledger_state_v9);
 
-        // Forward across the v8 -> v9 hard fork is supported; backwards is not.
-        let translated = ledger_state
-            .translate(LedgerVersion::V9)
-            .expect("ledger state v8 can be translated to v9");
-        assert_eq!(translated.ledger_version(), LedgerVersion::V9);
+        // Cross-version translations are unsupported on the stagenet branch.
+        assert!(ledger_state.translate(LedgerVersion::V9).is_err());
         assert!(ledger_state_v9.translate(LedgerVersion::V8).is_err());
 
         Ok(())
