@@ -18,7 +18,7 @@
 # Nightfrost
 
 A lean indexer for the [Midnight](https://midnight.network) blockchain with a
-REST API. 
+REST API. This project integrates with the Midnight Network.
 
 ```
 ┌───────────────┐   Subxt (WS)   ┌──────────────────┐   index   ┌───────────┐
